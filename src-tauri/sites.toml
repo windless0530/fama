@@ -1,0 +1,30 @@
+# Fama 站点注册表（design.md §3.1）
+# 新增站点 = 加一段 [[site]] + 在 src/injectors.rs 的 INJECTORS 里注册脚本文件
+
+[[site]]
+id = "chatgpt"
+name = "ChatGPT"
+url = "https://chatgpt.com/"
+icon = "chatgpt"
+injector = "chatgpt"
+
+[[site]]
+id = "glm"
+name = "GLM"
+url = "https://chatglm.cn/"
+icon = "glm"
+injector = "glm"
+
+[[site]]
+id = "deepseek"
+name = "DeepSeek"
+url = "https://chat.deepseek.com/"
+icon = "deepseek"
+injector = "deepseek"
+
+[[site]]
+id = "kimi"
+name = "Kimi"
+url = "https://www.kimi.com/"
+icon = "kimi"
+injector = "kimi"
