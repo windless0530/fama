@@ -50,6 +50,10 @@ export async function listSites(): Promise<SiteInfo[]> {
   return invoke("list_sites");
 }
 
+export async function preloadTabs(): Promise<void> {
+  await invoke("preload_tabs");
+}
+
 export async function layoutUpdate(items: LayoutItem[]): Promise<void> {
   await invoke("layout_update", { items });
 }

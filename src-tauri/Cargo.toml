@@ -21,6 +21,8 @@ tokio = { version = "1", features = ["time"] }
 toml = "0.8"
 url = "2"
 percent-encoding = "2"
+# lib.rs setup 里清除窗口 FullSizeContentView 标志位用（版本与 wry 依赖树一致，避免重复编译）
+objc2-app-kit = "0.3.2"
 
 [profile.release]
 codegen-units = 1

@@ -1,7 +1,7 @@
 //! IPC 命令层（design.md §4）
 //! 错误以 "E_XXX: 描述" 字符串形式返回前端。
 
-use tauri::{AppHandle, State, Wry};
+use tauri::{AppHandle, Manager, State, Wry};
 
 use crate::inject::{self, DispatchResult};
 use crate::sites::SiteInfo;
@@ -40,6 +40,22 @@ pub fn layout_update(
         }
     }
     tabs::apply_layout(&app, &tabs_state, &items)
+}
+
+/// 预建全部站点 webview（隐藏加载），让首次分发 / 首次切 tab 时页面已就绪。
+/// 后台执行、立即返回；失败仅打日志。
+#[tauri::command]
+pub fn preload_tabs(app: AppHandle<Wry>, sites: State<Sites>) -> Result<(), String> {
+    let all: Vec<crate::sites::SiteConfig> = sites.0.clone();
+    tauri::async_runtime::spawn(async move {
+        for site in &all {
+            let tabs = app.state::<Tabs>();
+            if let Err(e) = tabs::ensure_tab(&app, &tabs, site) {
+                eprintln!("[preload] {} 预建失败: {}", site.id, e);
+            }
+        }
+    });
+    Ok(())
 }
 
 #[tauri::command]

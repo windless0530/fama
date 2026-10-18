@@ -6,12 +6,13 @@
 //!
 //! webview 句柄由本模块自管注册表持有（创建后插入），不依赖运行时枚举 API。
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::mpsc;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
+use tauri::webview::PageLoadEvent;
 use tauri::{
     AppHandle, LogicalPosition, LogicalSize, Manager, Webview, WebviewBuilder, WebviewUrl, Wry,
 };
@@ -41,6 +42,13 @@ pub struct LayoutItem {
 pub struct Tabs {
     webviews: Mutex<HashMap<String, Webview<Wry>>>,
     rects: Mutex<HashMap<String, Rect>>,
+    /// 已完成首次页面加载的站点。
+    /// macOS 上 wry 的 url() 对未加载的 WKWebView 会 panic（URL 为 nil 时 unwrap），
+    /// 读取 URL / eval 前必须先确认页面就绪。
+    loaded: Mutex<HashSet<String>>,
+    /// 创建互斥：preload / layout_update / dispatch 可能并发 ensure_tab，
+    /// 注册表插入在创建之后，需要串行化 + 双重检查防止重复创建。
+    creating: Mutex<()>,
 }
 
 impl Tabs {
@@ -48,11 +56,21 @@ impl Tabs {
         Self {
             webviews: Mutex::new(HashMap::new()),
             rects: Mutex::new(HashMap::new()),
+            loaded: Mutex::new(HashSet::new()),
+            creating: Mutex::new(()),
         }
     }
 
     fn get(&self, site_id: &str) -> Option<Webview<Wry>> {
         self.webviews.lock().unwrap().get(site_id).cloned()
+    }
+
+    fn mark_loaded(&self, site_id: &str) {
+        self.loaded.lock().unwrap().insert(site_id.to_string());
+    }
+
+    fn is_loaded(&self, site_id: &str) -> bool {
+        self.loaded.lock().unwrap().contains(site_id)
     }
 }
 
@@ -61,39 +79,80 @@ pub fn ensure_tab(app: &AppHandle<Wry>, tabs: &Tabs, site: &SiteConfig) -> Resul
     if tabs.get(&site.id).is_some() {
         return Ok(());
     }
+    // 串行化创建（持锁跨越主线程往返；主线程本身不取此锁，无死锁）
+    let _guard = tabs.creating.lock().unwrap();
+    // 双重检查：等锁期间可能已被并发调用创建
+    if tabs.get(&site.id).is_some() {
+        return Ok(());
+    }
     let (tx, rx) = mpsc::channel();
     let site_id = site.id.clone();
     let site = site.clone();
     let app2 = app.clone();
+    eprintln!("[tabs] create {} {}", site.id, site.url);
     app.run_on_main_thread(move || {
-        let res: Result<Webview<Wry>, String> = app2
-            .get_webview_window("main")
-            .ok_or_else(|| "main window 不存在".to_string())
-            .and_then(|_| {
-                let window = app2
-                    .get_window("main")
-                    .ok_or_else(|| "main window 不存在".to_string())?;
-                let wv = window
-                    .add_child(
-                        WebviewBuilder::new(
-                            site.id.clone(),
-                            WebviewUrl::External(site.url.clone()),
-                        ),
-                        LogicalPosition::new(0.0, 0.0),
-                        LogicalSize::new(1.0, 1.0),
-                    )
-                    .map_err(|e| e.to_string())?;
-                // 先隐藏，等 layout_update 给出真实位置再显示
-                wv.hide().map_err(|e| e.to_string())?;
-                Ok(wv)
-            });
+        let res: Result<Webview<Wry>, String> = (|| {
+            // 配置文件创建的窗口只注册在 webview 表里（get_window 查不到），
+            // 经 UI webview 反查宿主 Window 才能挂子 webview
+            let window = app2
+                .get_webview("main")
+                .ok_or_else(|| "main UI webview 不存在".to_string())?
+                .window();
+            // 初建 frame 必须给"标题栏以下的正常尺寸"：
+            // macOS 上 WKWebView 以创建时 frame 减窗口安全区（标题栏 32pt）确定首个布局视口；
+            // 1×1 隐藏在 (0,0)（fullSizeContentView 下正处于标题栏底下）会把视口钳成 1×(1-32) 的负高度，
+            // 页面后续一直按错误视口排版，渲染出上下内缩、透出占位网格的现象。
+            let (init_w, init_h) = {
+                let scale = window.scale_factor().unwrap_or(1.0);
+                window
+                    .inner_size()
+                    .map(|s| s.to_logical::<f64>(scale))
+                    .map(|s| (s.width.max(100.0), (s.height - 44.0).max(100.0)))
+                    .unwrap_or((1200.0, 756.0))
+            };
+            let wv = match window.add_child(
+                WebviewBuilder::new(
+                    site.id.clone(),
+                    WebviewUrl::External(site.url.clone()),
+                )
+                .on_navigation(|url| {
+                    eprintln!("[tabs] navigation {url}");
+                    true
+                })
+                .on_page_load(|wv, payload| {
+                    eprintln!("[tabs] {} page {:?} {}", wv.label(), payload.event(), payload.url());
+                    if matches!(payload.event(), PageLoadEvent::Finished) {
+                        wv.state::<Tabs>().mark_loaded(wv.label());
+                    }
+                }),
+                LogicalPosition::new(0.0, 44.0),
+                LogicalSize::new(init_w, init_h),
+            ) {
+                Ok(wv) => wv,
+                // 已存在（异常时序残留）：改为接管现有句柄，保持幂等
+                Err(tauri::Error::WebviewLabelAlreadyExists(_)) => app2
+                    .get_webview(&site.id)
+                    .ok_or_else(|| "webview 已存在但获取句柄失败".to_string())?,
+                Err(e) => return Err(e.to_string()),
+            };
+            // 先隐藏，等 layout_update 给出真实位置再显示
+            wv.hide().map_err(|e| e.to_string())?;
+            Ok(wv)
+        })();
         let _ = tx.send(res);
     })
     .map_err(|e| format!("派发主线程失败: {e}"))?;
 
     match rx.recv_timeout(CREATE_TIMEOUT) {
         Ok(res) => {
-            let wv = res?;
+            let wv = match res {
+                Ok(wv) => wv,
+                Err(e) => {
+                    eprintln!("[tabs] {} create failed: {}", site_id, e);
+                    return Err(e);
+                }
+            };
+            eprintln!("[tabs] {} registered", site_id);
             tabs.webviews.lock().unwrap().insert(site_id, wv);
             Ok(())
         }
@@ -123,6 +182,7 @@ pub fn apply_layout(app: &AppHandle<Wry>, tabs: &Tabs, items: &[LayoutItem]) -> 
         .iter()
         .map(|i| (i.site_id.clone(), i.rect.clone()))
         .collect();
+    eprintln!("[tabs] apply layout: {:?}", items);
 
     let (tx, rx) = mpsc::channel();
     app.run_on_main_thread(move || {
@@ -130,10 +190,24 @@ pub fn apply_layout(app: &AppHandle<Wry>, tabs: &Tabs, items: &[LayoutItem]) -> 
         // 遍历注册表中的站点 webview：在列表中的摆放+显示，不在的隐藏
         for (label, wv) in handles {
             if let Some((_, rect)) = items.iter().find(|(id, _)| *id == label) {
+                let bounds = tauri::Rect {
+                    position: LogicalPosition::new(rect.x, rect.y).into(),
+                    size: LogicalSize::new(rect.w, rect.h).into(),
+                };
+                // 位置和尺寸必须一次设置：macOS 上分两次调用会读取旧 frame，
+                // 在子 webview 上可能产生错误的纵向偏移或上下留白。
+                // show 之后做一次 ±1px 的抖动再落回目标值：隐藏状态下 WebKit 不处理
+                // frame 变化，页面布局视口停留在创建时的值；同值重设会被 AppKit 去重
+                // 直接跳过，必须真的产生 frame 变化才能触发视口重同步。
+                let nudge = tauri::Rect {
+                    position: LogicalPosition::new(rect.x, rect.y).into(),
+                    size: LogicalSize::new(rect.w, (rect.h - 1.0).max(1.0)).into(),
+                };
                 if let Err(e) = wv
-                    .set_position(LogicalPosition::new(rect.x, rect.y))
-                    .and_then(|_| wv.set_size(LogicalSize::new(rect.w, rect.h)))
+                    .set_bounds(bounds)
                     .and_then(|_| wv.show())
+                    .and_then(|_| wv.set_bounds(nudge))
+                    .and_then(|_| wv.set_bounds(bounds))
                 {
                     res = Err(format!("布局 {label} 失败: {e}"));
                 }
@@ -198,6 +272,20 @@ impl From<serde_json::Error> for EvalError {
 
 const ACK_TIMEOUT: Duration = Duration::from_millis(3000);
 const ACK_POLL_INTERVAL: Duration = Duration::from_millis(150);
+/// 等待页面完成首次加载的上限（AI 站点首屏较重）
+const READY_TIMEOUT: Duration = Duration::from_secs(8);
+
+/// 等待站点页面完成首次加载：页面未就绪时 wry 的 url() 会 panic、eval 也无处执行
+async fn wait_page_ready(tabs: &Tabs, site_id: &str) -> Result<(), EvalError> {
+    let deadline = Instant::now() + READY_TIMEOUT;
+    while !tabs.is_loaded(site_id) {
+        if Instant::now() >= deadline {
+            return Err(EvalError::TabNotReady);
+        }
+        tokio::time::sleep(ACK_POLL_INTERVAL).await;
+    }
+    Ok(())
+}
 
 /// 在站点页面执行脚本并等待 hash-ACK 结果（design.md §2.3 双通道的兜底通道；
 /// iOS 原生 eval 带返回值后，本函数退化为直接解析返回值）。
@@ -209,6 +297,7 @@ pub async fn eval_with_ack(
     nonce: u64,
 ) -> Result<serde_json::Value, EvalError> {
     let wv = tabs.get(site_id).ok_or(EvalError::TabNotReady)?;
+    wait_page_ready(tabs, site_id).await?;
     wv.eval(js).map_err(|e| EvalError::Script(e.to_string()))?;
 
     let prefix = format!("fama-ack={nonce}:");
@@ -233,6 +322,10 @@ pub async fn eval_with_ack(
 /// 读取站点 webview 当前 URL 的 fragment（读取派发到主线程，同步等待）
 fn read_fragment(app: &AppHandle<Wry>, tabs: &Tabs, site_id: &str) -> Option<String> {
     let wv = tabs.get(site_id)?;
+    // WKWebView 首次提交导航前 URL 为 nil，wry 的 url() 会 unwrap panic
+    if !tabs.is_loaded(site_id) {
+        return None;
+    }
     let (tx, rx) = mpsc::channel();
     app.run_on_main_thread(move || {
         // 站点页 URL 形如 https://host/path#fama-ack=...；SPA 改 hash 不触发导航

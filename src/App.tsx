@@ -9,6 +9,7 @@ import {
   TargetStatus,
   dispatchQuestion,
   listSites,
+  preloadTabs,
 } from "./lib/ipc";
 
 const STATUS_LABEL: Partial<Record<TargetStatus, string>> = {
@@ -21,7 +22,6 @@ const STATUS_LABEL: Partial<Record<TargetStatus, string>> = {
 export default function App() {
   const [sites, setSites] = useState<SiteInfo[]>([]);
   const [activeTab, setActiveTab] = useState<string | null>(null);
-  const [selected, setSelected] = useState<string[]>([]);
   const [fillOnly, setFillOnly] = useState(false);
   const [dispatching, setDispatching] = useState(false);
   const [statusBySite, setStatusBySite] = useState<
@@ -38,7 +38,10 @@ export default function App() {
         setSites(s);
         if (s.length > 0) {
           setActiveTab(s[0].id);
-          setSelected(s.map((x) => x.id)); // 默认全选（design.md §12 待确认项）
+          // 预建全部站点 webview（隐藏加载），首次分发/切 tab 即就绪
+          void preloadTabs().catch((e) =>
+            console.error("preload_tabs 失败", e),
+          );
         }
       } catch (e) {
         setStatusErr(true);
@@ -51,20 +54,13 @@ export default function App() {
     setActiveTab(siteId);
   }, []);
 
-  const onToggleSite = useCallback((siteId: string) => {
-    setSelected((cur) =>
-      cur.includes(siteId)
-        ? cur.filter((x) => x !== siteId)
-        : [...cur, siteId],
-    );
-  }, []);
-
   const onSend = useCallback(
     async (question: string) => {
       setDispatching(true);
       setStatusErr(false);
       setStatusLine("发送中…");
-      const targets = selected;
+      // 每题广播全部站点（用户确认的用法）
+      const targets = sites.map((s) => s.id);
       setStatusBySite((m) => {
         const next = { ...m };
         for (const id of targets) next[id] = "dispatching";
@@ -112,7 +108,7 @@ export default function App() {
         setDispatching(false);
       }
     },
-    [selected, fillOnly],
+    [sites, fillOnly],
   );
 
   return (
@@ -124,11 +120,15 @@ export default function App() {
         onSelect={onSelectTab}
         onOpenHistory={() => setHistoryOpen(true)}
       />
-      <ContentArea activeSiteId={activeTab} hasSites={sites.length > 0} />
+      <ContentArea
+        activeSiteId={activeTab}
+        hasSites={sites.length > 0}
+        onError={(msg) => {
+          setStatusErr(true);
+          setStatusLine(msg);
+        }}
+      />
       <InputBar
-        sites={sites}
-        selected={selected}
-        onToggleSite={onToggleSite}
         fillOnly={fillOnly}
         onToggleFillOnly={() => setFillOnly((v) => !v)}
         dispatching={dispatching}

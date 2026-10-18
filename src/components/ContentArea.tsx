@@ -5,15 +5,17 @@ import { layoutUpdate } from "../lib/ipc";
 interface Props {
   activeSiteId: string | null;
   hasSites: boolean;
+  onError: (msg: string) => void;
 }
 
 /**
  * 透明占位区：站点 webview（原生子视图）按此矩形摆放（design.md §2.1）。
  * ResizeObserver 监听尺寸变化 → 上报 Rust → 调整原生 webview frame。
  */
-export default function ContentArea({ activeSiteId, hasSites }: Props) {
+export default function ContentArea({ activeSiteId, hasSites, onError }: Props) {
   const ref = useRef<HTMLDivElement>(null);
   const lastRect = useRef<Rect | null>(null);
+  const lastSiteId = useRef<string | null>(null);
   const rafPending = useRef(false);
 
   useEffect(() => {
@@ -25,7 +27,9 @@ export default function ContentArea({ activeSiteId, hasSites }: Props) {
       const r = el.getBoundingClientRect();
       const rect: Rect = { x: r.x, y: r.y, w: r.width, h: r.height };
       const last = lastRect.current;
+      const siteChanged = lastSiteId.current !== activeSiteId;
       if (
+        !siteChanged &&
         last &&
         Math.abs(last.x - rect.x) < 0.5 &&
         Math.abs(last.y - rect.y) < 0.5 &&
@@ -35,8 +39,11 @@ export default function ContentArea({ activeSiteId, hasSites }: Props) {
         return;
       }
       lastRect.current = rect;
+      lastSiteId.current = activeSiteId;
       if (activeSiteId) {
-        void layoutUpdate([{ siteId: activeSiteId, rect }]);
+        layoutUpdate([{ siteId: activeSiteId, rect }]).catch((e) =>
+          onError(`布局更新失败（${activeSiteId}）：${e}`),
+        );
       }
     };
 
@@ -59,7 +66,7 @@ export default function ContentArea({ activeSiteId, hasSites }: Props) {
   return (
     <div className="content-area" ref={ref}>
       <div className="hint">
-        <span>{hasSites ? "选择上方标签页开始" : "站点配置加载中…"}</span>
+        <span>{hasSites ? "站点加载中…（可直接在下方输入提问）" : "站点配置加载中…"}</span>
       </div>
     </div>
   );
