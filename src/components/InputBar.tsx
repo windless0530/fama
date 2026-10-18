@@ -38,6 +38,15 @@ export default function InputBar({
 
   return (
     <div className="inputbar">
+      {/* 状态行放输入框上方、仅有内容时渲染：
+          空状态不占位（否则固定吃掉 ~20px，输入框整体悬在半空），
+          出现/消失时输入行距窗口底边的距离保持不变 */}
+      {statusLine && (
+        <div className={`status-line${statusIsError ? " err" : ""}`}>
+          {statusLine}
+        </div>
+      )}
+
       <div className="input-row">
         <textarea
           ref={taRef}
@@ -47,7 +56,9 @@ export default function InputBar({
           onKeyDown={onKeydown}
           rows={1}
         />
-        <label className="toggle-fill" onClick={onToggleFillOnly}>
+        {/* label 隐式关联 checkbox：点文字即勾选，切换只走 onChange。
+            若 label 再挂 onClick 会与 onChange 各触发一次，双翻转抵消成"点了没反应"。 */}
+        <label className="toggle-fill" title="勾选后只把问题填进各站点输入框，不自动发送；取消勾选则填入后自动点发送">
           <input
             type="checkbox"
             checked={fillOnly}
@@ -58,10 +69,6 @@ export default function InputBar({
         <button className="send-btn" disabled={!canSend} onClick={send}>
           {dispatching ? "发送中…" : "发送"}
         </button>
-      </div>
-
-      <div className={`status-line${statusIsError ? " err" : ""}`}>
-        {statusLine}
       </div>
     </div>
   );

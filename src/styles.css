@@ -158,6 +158,14 @@ body {
   gap: 4px;
   cursor: pointer;
   user-select: none;
+  /* 行本身是 flex-end（多行时按钮沉底），label 只有 ~16px 高，
+     不单独居中会被钉在行底部，视觉上脱离输入框中线 */
+  align-self: center;
+}
+.toggle-fill input[type="checkbox"] {
+  margin: 0;
+  accent-color: var(--accent);
+  cursor: pointer;
 }
 
 .input-row {
@@ -173,6 +181,9 @@ body {
   min-height: 40px;
   padding: 9px 12px;
   font-size: 15px;
+  /* 显式行高让单行高度精确等于 40px（9*2 padding + 20 行高 + 2 边框），
+     与发送按钮等高、文字在框内垂直居中；缺省 normal 行高会随字体浮动 */
+  line-height: 20px;
   font-family: inherit;
   border: 1px solid var(--border);
   border-radius: 10px;
@@ -199,7 +210,7 @@ body {
 .status-line {
   font-size: 12px;
   color: var(--fg-dim);
-  min-height: 14px;
+  word-break: break-word; /* 多站点失败信息拼接可能很长，允许换行 */
 }
 .status-line .err { color: var(--err); }
 

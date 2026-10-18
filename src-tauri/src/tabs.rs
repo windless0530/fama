@@ -46,6 +46,10 @@ pub struct Tabs {
     /// macOS 上 wry 的 url() 对未加载的 WKWebView 会 panic（URL 为 nil 时 unwrap），
     /// 读取 URL / eval 前必须先确认页面就绪。
     loaded: Mutex<HashSet<String>>,
+    /// 当前处于"可见"状态的站点（apply_layout 显示后插入、隐藏时移除）。
+    /// 从隐藏恢复显示时 WKWebView 的远端图层可能停留在旧几何（隐藏期间的
+    /// frame 变化不进图层），需要跨 CA 事务的分步重设，见 apply_layout。
+    shown: Mutex<HashSet<String>>,
     /// 创建互斥：preload / layout_update / dispatch 可能并发 ensure_tab，
     /// 注册表插入在创建之后，需要串行化 + 双重检查防止重复创建。
     creating: Mutex<()>,
@@ -57,6 +61,7 @@ impl Tabs {
             webviews: Mutex::new(HashMap::new()),
             rects: Mutex::new(HashMap::new()),
             loaded: Mutex::new(HashSet::new()),
+            shown: Mutex::new(HashSet::new()),
             creating: Mutex::new(()),
         }
     }
@@ -135,8 +140,17 @@ pub fn ensure_tab(app: &AppHandle<Wry>, tabs: &Tabs, site: &SiteConfig) -> Resul
                     .ok_or_else(|| "webview 已存在但获取句柄失败".to_string())?,
                 Err(e) => return Err(e.to_string()),
             };
-            // 先隐藏，等 layout_update 给出真实位置再显示
+            // 先隐藏，等 layout_update 给出真实位置再显示。
+            // frame 同时缩为 0：WKWebView 的远端图层在页面首次合成时可能
+            // 无视 hidden 标志继续绘制（幽灵页），0 尺寸图层无处可画。
+            // 显示路径（apply_layout）会先设目标 frame 再 show+nudge，视口
+            // 以 nudge 强制重同步，不受此处 0 尺寸影响。
             wv.hide().map_err(|e| e.to_string())?;
+            wv.set_bounds(tauri::Rect {
+                position: LogicalPosition::new(0.0, 0.0).into(),
+                size: LogicalSize::new(0.0, 0.0).into(),
+            })
+            .map_err(|e| e.to_string())?;
             Ok(wv)
         })();
         let _ = tx.send(res);
@@ -184,7 +198,23 @@ pub fn apply_layout(app: &AppHandle<Wry>, tabs: &Tabs, items: &[LayoutItem]) -> 
         .collect();
     eprintln!("[tabs] apply layout: {:?}", items);
 
+    // 哪些站点需要"从隐藏恢复"的完整重同步序列
+    let mut first_show: Vec<String> = Vec::new();
+    {
+        let mut shown = tabs.shown.lock().unwrap();
+        for it in &items {
+            if !shown.contains(&it.0) {
+                first_show.push(it.0.clone());
+            }
+        }
+        shown.retain(|id| items.iter().any(|(sid, _)| sid == id));
+        for it in &items {
+            shown.insert(it.0.clone());
+        }
+    }
+
     let (tx, rx) = mpsc::channel();
+    let app2 = app.clone();
     app.run_on_main_thread(move || {
         let mut res = Ok(());
         // 遍历注册表中的站点 webview：在列表中的摆放+显示，不在的隐藏
@@ -196,23 +226,53 @@ pub fn apply_layout(app: &AppHandle<Wry>, tabs: &Tabs, items: &[LayoutItem]) -> 
                 };
                 // 位置和尺寸必须一次设置：macOS 上分两次调用会读取旧 frame，
                 // 在子 webview 上可能产生错误的纵向偏移或上下留白。
-                // show 之后做一次 ±1px 的抖动再落回目标值：隐藏状态下 WebKit 不处理
-                // frame 变化，页面布局视口停留在创建时的值；同值重设会被 AppKit 去重
-                // 直接跳过，必须真的产生 frame 变化才能触发视口重同步。
-                let nudge = tauri::Rect {
-                    position: LogicalPosition::new(rect.x, rect.y).into(),
-                    size: LogicalSize::new(rect.w, (rect.h - 1.0).max(1.0)).into(),
-                };
-                if let Err(e) = wv
-                    .set_bounds(bounds)
-                    .and_then(|_| wv.show())
-                    .and_then(|_| wv.set_bounds(nudge))
-                    .and_then(|_| wv.set_bounds(bounds))
-                {
+                let is_first_show = first_show.iter().any(|id| id == &label);
+                if is_first_show {
+                    // 从隐藏恢复：WKWebView 的远端图层可能停留在旧几何（隐藏期间
+                    // 的 frame 变化不进图层，且同一主线程回合内的多次 setFrame 会
+                    // 合并成一个 CA 事务、净零变化被直接去重）。
+                    // 必须跨事务分步提交，保证"可见状态下存在真实的相邻事务差异"：
+                    // show 与两次 frame 变化各自落在不同 runloop 回合（各自提交）。
+                    let app3 = app2.clone();
+                    let (tx_, ty_, tw_, th_) = (rect.x, rect.y, rect.w, rect.h);
+                    let _ = wv.show();
+                    let wv1 = wv.clone();
+                    let wv2 = wv.clone();
+                    let wv3 = wv.clone();
+                    std::thread::spawn(move || {
+                        let mk = move |h: f64| tauri::Rect {
+                            position: LogicalPosition::new(tx_, ty_).into(),
+                            size: LogicalSize::new(tw_, h).into(),
+                        };
+                        std::thread::sleep(Duration::from_millis(50));
+                        let _ = app3.run_on_main_thread(move || {
+                            let _ = wv1.set_bounds(mk(th_));
+                        });
+                        std::thread::sleep(Duration::from_millis(50));
+                        let _ = app3.run_on_main_thread(move || {
+                            let _ = wv2.set_bounds(mk((th_ - 1.0).max(1.0)));
+                        });
+                        std::thread::sleep(Duration::from_millis(50));
+                        let _ = app3.run_on_main_thread(move || {
+                            let _ = wv3.set_bounds(mk(th_));
+                        });
+                    });
+                } else if let Err(e) = wv.set_bounds(bounds) {
+                    // 可见状态的常规重排：单次真实 frame 变化本事务内即生效
                     res = Err(format!("布局 {label} 失败: {e}"));
                 }
-            } else if let Err(e) = wv.hide() {
-                res = Err(format!("隐藏 {label} 失败: {e}"));
+            } else {
+                // 隐藏时必须同时把 frame 缩为 0：WKWebView 的远端图层合成
+                // 不总是尊重 NSView hidden（hide 落在页面首次合成附近时，
+                // 内容进程仍会把图层绘制到屏幕上，形成盖住一切的"幽灵页"）。
+                // 0 尺寸的图层无处可画，从机制上杜绝该现象。
+                let zero = tauri::Rect {
+                    position: LogicalPosition::new(0.0, 0.0).into(),
+                    size: LogicalSize::new(0.0, 0.0).into(),
+                };
+                if let Err(e) = wv.set_bounds(zero).and_then(|_| wv.hide()) {
+                    res = Err(format!("隐藏 {label} 失败: {e}"));
+                }
             }
         }
         let _ = tx.send(res);
