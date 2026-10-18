@@ -1,8 +1,6 @@
 import { KeyboardEvent, useRef, useState } from "react";
 
 interface Props {
-  fillOnly: boolean;
-  onToggleFillOnly: () => void;
   dispatching: boolean;
   statusLine: string;
   statusIsError: boolean;
@@ -10,8 +8,6 @@ interface Props {
 }
 
 export default function InputBar({
-  fillOnly,
-  onToggleFillOnly,
   dispatching,
   statusLine,
   statusIsError,
@@ -56,16 +52,6 @@ export default function InputBar({
           onKeyDown={onKeydown}
           rows={1}
         />
-        {/* label 隐式关联 checkbox：点文字即勾选，切换只走 onChange。
-            若 label 再挂 onClick 会与 onChange 各触发一次，双翻转抵消成"点了没反应"。 */}
-        <label className="toggle-fill" title="勾选后只把问题填进各站点输入框，不自动发送；取消勾选则填入后自动点发送">
-          <input
-            type="checkbox"
-            checked={fillOnly}
-            onChange={onToggleFillOnly}
-          />
-          仅填充
-        </label>
         <button className="send-btn" disabled={!canSend} onClick={send}>
           {dispatching ? "发送中…" : "发送"}
         </button>

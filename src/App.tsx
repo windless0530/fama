@@ -22,7 +22,6 @@ const STATUS_LABEL: Partial<Record<TargetStatus, string>> = {
 export default function App() {
   const [sites, setSites] = useState<SiteInfo[]>([]);
   const [activeTab, setActiveTab] = useState<string | null>(null);
-  const [fillOnly, setFillOnly] = useState(false);
   const [dispatching, setDispatching] = useState(false);
   const [statusBySite, setStatusBySite] = useState<
     Record<string, TargetStatus>
@@ -59,7 +58,7 @@ export default function App() {
       setDispatching(true);
       setStatusErr(false);
       setStatusLine("发送中…");
-      // 每题广播全部站点（用户确认的用法）
+      // 每题广播全部站点（用户确认的用法），始终自动发送
       const targets = sites.map((s) => s.id);
       setStatusBySite((m) => {
         const next = { ...m };
@@ -70,7 +69,7 @@ export default function App() {
         const results: DispatchResult[] = await dispatchQuestion(
           question,
           targets,
-          !fillOnly,
+          true,
         );
         setStatusBySite((m) => {
           const next = { ...m };
@@ -108,7 +107,7 @@ export default function App() {
         setDispatching(false);
       }
     },
-    [sites, fillOnly],
+    [sites],
   );
 
   return (
@@ -129,8 +128,6 @@ export default function App() {
         }}
       />
       <InputBar
-        fillOnly={fillOnly}
-        onToggleFillOnly={() => setFillOnly((v) => !v)}
         dispatching={dispatching}
         statusLine={statusLine}
         statusIsError={statusErr}
