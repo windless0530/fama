@@ -21,8 +21,40 @@ tokio = { version = "1", features = ["time"] }
 toml = "0.8"
 url = "2"
 percent-encoding = "2"
+
+# 以下仅在 macOS 编译（AppKit / WebKit / Security 均是苹果平台专属 crate；
+# lib.rs setup 里的窗口标志位清除、browser_session.rs 的 cookie 导入都在
+# #[cfg(target_os = "macos")] 内使用，保证 Windows/Linux 可编译）
+[target.'cfg(target_os = "macos")'.dependencies]
 # lib.rs setup 里清除窗口 FullSizeContentView 标志位用（版本与 wry 依赖树一致，避免重复编译）
-objc2-app-kit = "0.3.2"
+objc2-app-kit = { version = "0.3.2", features = ["NSWorkspace"] }
+# Retained / 运行时类型（与 wry 依赖树同版本族）
+objc2 = "0.6"
+objc2-foundation = { version = "0.3.2", features = [
+    "NSArray",
+    "NSBundle",
+    "NSDate",
+    "NSDictionary",
+    "NSHTTPCookie",
+    "NSString",
+    "NSURL",
+] }
+objc2-web-kit = { version = "0.3.2", features = [
+    "WKHTTPCookieStore",
+    "WKWebsiteDataStore",
+    "block2",
+] }
+block2 = "0.6"
+# 读取浏览器 Safe Storage 钥匙串条目（用户在 Keychain ACL 弹窗授权后）
+security-framework = "2"
+# 解密 Chromium v10 cookie：PBKDF2-HMAC-SHA1 派生 + AES-128-CBC
+aes = "0.8"
+cbc = { version = "0.1", features = ["alloc", "block-padding"] }
+pbkdf2 = { version = "0.12", default-features = false, features = ["hmac"] }
+hmac = "0.12"
+sha1 = "0.10"
+# Safe Storage 原始 secret 读出后立即 zeroize，只留内存派生 key
+zeroize = "1"
 
 [profile.release]
 codegen-units = 1

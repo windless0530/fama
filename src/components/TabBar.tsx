@@ -1,4 +1,5 @@
 import { SiteInfo, TargetStatus } from "../lib/ipc";
+import { IS_MACOS } from "../lib/platform";
 
 const DOT_CLASS: Partial<Record<TargetStatus, string>> = {
   sent: "sent",
@@ -13,6 +14,7 @@ interface Props {
   statusBySite: Record<string, TargetStatus>;
   onSelect: (siteId: string) => void;
   onOpenHistory: () => void;
+  onImportBrowser: () => void;
 }
 
 export default function TabBar({
@@ -21,6 +23,7 @@ export default function TabBar({
   statusBySite,
   onSelect,
   onOpenHistory,
+  onImportBrowser,
 }: Props) {
   return (
     <div className="tabbar">
@@ -38,6 +41,16 @@ export default function TabBar({
         );
       })}
       <span className="spacer" />
+      {/* 浏览器登录态导入仅 macOS 支持（后端其他平台返回 E_UNSUPPORTED_PLATFORM） */}
+      {IS_MACOS && (
+        <button
+          className="icon-btn"
+          title="从浏览器导入登录状态"
+          onClick={onImportBrowser}
+        >
+          🔑
+        </button>
+      )}
       <button
         className="icon-btn"
         title="历史记录"

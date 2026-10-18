@@ -4,6 +4,14 @@ mod sites;
 mod store;
 mod tabs;
 
+// 浏览器登录态导入：macOS 真实现；其他平台用同签名 stub（统一以
+// crate::browser_session 引用，Windows/Linux 编译通过并返回 E_UNSUPPORTED_PLATFORM）
+#[cfg(target_os = "macos")]
+mod browser_session;
+#[cfg(not(target_os = "macos"))]
+#[path = "browser_session_stub.rs"]
+mod browser_session;
+
 use tauri::Manager;
 
 /// 全局站点注册表（setup 时加载一次）
@@ -53,6 +61,7 @@ pub fn run() {
             commands::dispatch_question,
             commands::list_rounds,
             commands::rate,
+            commands::import_browser_session,
         ])
         .run(tauri::generate_context!())
         .expect("error while running fama");

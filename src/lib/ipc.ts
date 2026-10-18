@@ -46,6 +46,17 @@ export interface Round {
   targets: RoundTarget[];
 }
 
+// 浏览器登录态导入报告（commands.rs import_browser_session 的契约）
+export interface ImportReport {
+  browser: string;
+  profile: string;
+  matched: number;
+  injected: number;
+  skippedDecrypt: number;
+  skippedOther: number;
+  reloaded: string[];
+}
+
 export async function listSites(): Promise<SiteInfo[]> {
   return invoke("list_sites");
 }
@@ -83,4 +94,11 @@ export async function rate(
   rating: 1 | -1,
 ): Promise<void> {
   await invoke("rate", { roundId, siteId, rating });
+}
+
+/** 从默认 Chromium 系浏览器导入登录 cookie；siteIds 为空 = 全部站点 */
+export async function importBrowserSession(
+  siteIds: string[],
+): Promise<ImportReport> {
+  return invoke("import_browser_session", { siteIds });
 }

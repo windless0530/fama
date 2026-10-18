@@ -77,6 +77,20 @@ impl Tabs {
     fn is_loaded(&self, site_id: &str) -> bool {
         self.loaded.lock().unwrap().contains(site_id)
     }
+
+    /// reload 已完成首次加载的站点 webview（浏览器 cookie 导入后刷新登录态用）。
+    /// 未加载的站点首次导航自然带上新 cookie，无需处理。返回实际触发 reload 的站点。
+    pub fn reload_loaded(&self, site_ids: &[String]) -> Vec<String> {
+        let mut reloaded = Vec::new();
+        let loaded = self.loaded.lock().unwrap();
+        for (id, wv) in self.webviews.lock().unwrap().iter() {
+            if site_ids.contains(id) && loaded.contains(id) && wv.eval("location.reload()").is_ok()
+            {
+                reloaded.push(id.clone());
+            }
+        }
+        reloaded
+    }
 }
 
 /// 幂等创建站点 webview。创建动作派发到主线程执行，句柄回传存入注册表。

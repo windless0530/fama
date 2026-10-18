@@ -3,6 +3,7 @@ import TabBar from "./components/TabBar";
 import ContentArea from "./components/ContentArea";
 import InputBar from "./components/InputBar";
 import HistorySheet from "./components/HistorySheet";
+import ImportDialog from "./components/ImportDialog";
 import {
   DispatchResult,
   SiteInfo,
@@ -29,6 +30,7 @@ export default function App() {
   const [statusLine, setStatusLine] = useState("");
   const [statusErr, setStatusErr] = useState(false);
   const [historyOpen, setHistoryOpen] = useState(false);
+  const [importOpen, setImportOpen] = useState(false);
 
   useEffect(() => {
     void (async () => {
@@ -118,6 +120,7 @@ export default function App() {
         statusBySite={statusBySite}
         onSelect={onSelectTab}
         onOpenHistory={() => setHistoryOpen(true)}
+        onImportBrowser={() => setImportOpen(true)}
       />
       <ContentArea
         activeSiteId={activeTab}
@@ -134,6 +137,9 @@ export default function App() {
         onSend={(q) => void onSend(q)}
       />
       {historyOpen && <HistorySheet onClose={() => setHistoryOpen(false)} />}
+      {importOpen && sites.length > 0 && (
+        <ImportDialog sites={sites} onClose={() => setImportOpen(false)} />
+      )}
     </div>
   );
 }

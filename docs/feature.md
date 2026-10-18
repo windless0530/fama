@@ -19,8 +19,8 @@
 ### 2.1 多 Tab 内嵌 AI 网页
 
 - 首批站点：ChatGPT（chatgpt.com）、GLM（chatglm.cn）、DeepSeek（chat.deepseek.com）、Kimi（kimi.com）；
-- 各 Tab 使用独立 cookie 容器：同一家可并行登录不同账号，互不干扰；
-- 登录/登出/会话历史直接使用各家网页自带能力，App 不接管、不存储任何站点凭据；
+- App 使用自己的 cookie 容器，与系统浏览器天然隔离；macOS 支持用户主动从默认 Chromium 系浏览器（Chrome / Edge / Brave / Vivaldi / Opera / Chromium）导入登录 cookie，免去重复登录（需通过确认框与系统钥匙串授权两道确认；不读取浏览器密码库，不支持 Safari / Firefox 导入；详见 design.md §2.5.1）；
+- 登录/登出/会话历史直接使用各家网页自带能力，App 不接管、不保存浏览器密码或站点账号密码；导入的 cookie 进入本 app 自己的 webview 数据容器，仅本 app 可见、与系统浏览器相互独立，带有效期的 cookie 可能被持久化到本机（与在 app 里正常登录产生的 cookie 行为一致）；
 - 桌面端可选「分栏/网格」布局，多站点回答并排对照；移动端为单 Tab + 底部切换。
 
 ### 2.2 统一输入 · 一次多发（核心价值）

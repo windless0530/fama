@@ -3,6 +3,7 @@
 
 use tauri::{AppHandle, Manager, State, Wry};
 
+use crate::browser_session;
 use crate::inject::{self, DispatchResult};
 use crate::sites::SiteInfo;
 use crate::store::Round;
@@ -126,9 +127,8 @@ pub async fn list_rounds(
     limit: Option<i64>,
     before: Option<i64>,
 ) -> Result<Vec<Round>, String> {
-    Ok(db
-        .0
-        .list_rounds(limit.unwrap_or(50).clamp(1, 200), before)?)
+    db.0
+        .list_rounds(limit.unwrap_or(50).clamp(1, 200), before)
 }
 
 #[tauri::command]
@@ -142,4 +142,33 @@ pub async fn rate(
         return Err("E_BAD_RATING: rating 只允许 1 或 -1".into());
     }
     db.0.set_rating(round_id, &site_id, rating)
+}
+
+/// 从默认 Chromium 系浏览器导入登录 cookies（用户已在前端确认框同意后调用）。
+/// 流程与授权模型见 browser_session.rs 模块注释；site_ids 为空 = 全部站点。
+/// Keychain ACL 弹窗会阻塞到用户应答，重活放 spawn_blocking 不占异步线程。
+#[tauri::command]
+pub async fn import_browser_session(
+    app: AppHandle<Wry>,
+    sites: State<'_, Sites>,
+    site_ids: Vec<String>,
+) -> Result<browser_session::ImportReport, String> {
+    let targets: Vec<crate::sites::SiteConfig> = if site_ids.is_empty() {
+        sites.0.clone()
+    } else {
+        sites
+            .0
+            .iter()
+            .filter(|s| site_ids.contains(&s.id))
+            .cloned()
+            .collect()
+    };
+    if targets.is_empty() {
+        return Err("E_NO_SITES: 未选择任何有效站点".into());
+    }
+    tauri::async_runtime::spawn_blocking(move || {
+        browser_session::import(&app, &targets).map_err(|e| format!("{}: {}", e.code, e.message))
+    })
+    .await
+    .map_err(|e| format!("E_INJECT_FAILED: 导入任务异常 {e}"))?
 }
