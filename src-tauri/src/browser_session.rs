@@ -6,6 +6,12 @@
 //! - 读取该浏览器的 `"<Browser> Safe Storage"` 钥匙串条目（macOS 会弹 ACL 授权框，
 //!   为第二道用户授权），PBKDF2 派生 cookie 解密 key；
 //! - 以临时副本只读查询浏览器 Cookies 数据库，只筛选已配置站点 host 匹配的条目；
+//! - 扫描全部 profile（`Local State` 可读时取 `profile.info` 全集、last_used
+//!   优先；不可读时探测已知命名 `Default` / `Profile 1..9`），结果按
+//!   (host, name) 去重合并；
+//! - 硬前提：macOS TCC 保护浏览器数据目录，运行环境需「完全磁盘访问」授权
+//!   （dev = 运行它的终端 App，安装版 = fama.app）；权限拒绝（EPERM/EACCES）
+//!   报 `E_BROWSER_DATA_TCC_DENIED`，一次失败即返回，不重试；
 //! - 解密后注入 WKWebsiteDataStore.defaultDataStore()（所有站点 webview 共享），
 //!   并 reload 已加载的站点页面恢复登录态。
 //!
@@ -19,7 +25,7 @@
 //! 可能由 WebKit 持久化到本机容器内——这与导入后在 app 里正常登录产生的 cookie
 //! 行为一致。
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::sync::Mutex;
@@ -40,6 +46,7 @@ pub const E_UNSUPPORTED_BROWSER: &str = "E_UNSUPPORTED_BROWSER";
 pub const E_KEYCHAIN_NOT_FOUND: &str = "E_KEYCHAIN_NOT_FOUND";
 pub const E_KEYCHAIN_DENIED: &str = "E_KEYCHAIN_DENIED";
 pub const E_BROWSER_DATA_MISSING: &str = "E_BROWSER_DATA_MISSING";
+pub const E_BROWSER_DATA_TCC_DENIED: &str = "E_BROWSER_DATA_TCC_DENIED";
 pub const E_COOKIE_DB_LOCKED: &str = "E_COOKIE_DB_LOCKED";
 pub const E_DECRYPT_FAILED: &str = "E_DECRYPT_FAILED";
 pub const E_INJECT_FAILED: &str = "E_INJECT_FAILED";
@@ -307,17 +314,116 @@ impl Drop for TempDirGuard {
     }
 }
 
-/// `Local State` 里 `profile.last_used` 指示的目录名，回退 "Default"
-fn last_used_profile(base: &Path) -> String {
-    std::fs::read_to_string(base.join("Local State"))
-        .ok()
-        .and_then(|txt| serde_json::from_str::<serde_json::Value>(&txt).ok())
-        .and_then(|v| {
-            v.pointer("/profile/last_used")
-                .and_then(|x| x.as_str())
-                .map(|s| s.to_string())
-        })
-        .unwrap_or_else(|| "Default".to_string())
+// ---------- TCC / 权限拒绝识别 ----------
+//
+// macOS 把 Chromium 系浏览器的用户数据目录纳入 TCC 隐私保护：fama 进程
+// （dev 下从终端 App 派生）读取 `Local State` / `Cookies` 文件内容时得到
+// EPERM / EACCES（Rust 归类为 `ErrorKind::PermissionDenied`），但 stat /
+// is_file() 元数据探测不受影响。据此在错误分类里把权限拒绝单独拎出，
+// 给出「完全磁盘访问」的可操作指引，而不是误报数据缺失。
+
+/// `E_BROWSER_DATA_TCC_DENIED` 的完整用户提示。
+/// `what`：被拦截的读取目标（如 "Cookies 数据库"）。
+fn tcc_denied(browser_name: &str, what: &str) -> ImportError {
+    ImportError::new(
+        E_BROWSER_DATA_TCC_DENIED,
+        format!(
+            "{browser_name} 的浏览器数据（{what}）受 macOS 隐私保护（TCC）拦截，fama 无法读取。\
+             请在「系统设置 → 隐私与安全性 → 完全磁盘访问」中授权：开发模式\
+             （npm run tauri dev）给运行它的终端 App（如 iTerm2 / Terminal）授权；\
+             安装版给 fama.app 授权。授权后完全退出并重启该 App 再试"
+        ),
+    )
+}
+
+/// 浏览器数据读取的 io 错误分类：权限拒绝（EPERM / EACCES）→ TCC 错误
+/// （`local_state_denied` 时在提示里合并 Local State 同被拦截的信号）；
+/// 其余错误归为 DB 读取问题并保留 `action` 上下文。
+fn browser_read_err(
+    e: &std::io::Error,
+    browser_name: &str,
+    action: &str,
+    local_state_denied: bool,
+) -> ImportError {
+    if e.kind() == std::io::ErrorKind::PermissionDenied {
+        let what = if local_state_denied {
+            "Cookies 数据库与 Local State"
+        } else {
+            "Cookies 数据库"
+        };
+        tcc_denied(browser_name, what)
+    } else {
+        ImportError::new(E_COOKIE_DB_LOCKED, format!("{action}: {e}"))
+    }
+}
+
+// ---------- 多 profile 枚举 ----------
+
+/// profile 扫描计划
+struct ProfileScan {
+    /// 有序 profile 目录名（last_used 优先，其余按名称字典序）
+    profiles: Vec<String>,
+    /// `Local State` 读取被权限拒绝（TCC 强信号；不影响继续探测）
+    local_state_denied: bool,
+}
+
+/// 从 `Local State` JSON 解析有序 profile 名。
+/// 返回 `profile.info` 的 key 集合（保证含 "Default"），`last_used` 优先、
+/// 其余按字典序。None = JSON 解析失败或没有 `profile.info`（调用方回退探测）。
+fn profiles_from_local_state(txt: &str) -> Option<Vec<String>> {
+    let v = serde_json::from_str::<serde_json::Value>(txt).ok()?;
+    let info = v.pointer("/profile/info")?.as_object()?;
+    let mut names: Vec<String> = info.keys().cloned().collect();
+    if names.is_empty() {
+        return None;
+    }
+    if !names.iter().any(|n| n == "Default") {
+        names.push("Default".to_string());
+    }
+    names.sort();
+    names.dedup();
+    let last_used = v.pointer("/profile/last_used").and_then(|x| x.as_str());
+    let mut ordered: Vec<String> = Vec::with_capacity(names.len());
+    if let Some(lu) = last_used.filter(|lu| names.iter().any(|n| n == lu)) {
+        ordered.push(lu.to_string());
+    }
+    ordered.extend(names.into_iter().filter(|n| Some(n.as_str()) != last_used));
+    Some(ordered)
+}
+
+/// 回退探测（`Local State` 不可读 / 无 profile.info 时）：已知命名
+/// `Default`、`Profile 1`..`Profile 9` 中，`is_file()` 元数据探测（TCC 下
+/// 仍可用）能命中 Cookies 候选的才进入扫描。
+fn probe_known_profiles(base: &Path) -> Vec<String> {
+    let mut names = vec!["Default".to_string()];
+    names.extend((1..=9).map(|i| format!("Profile {i}")));
+    names
+        .into_iter()
+        .filter(|n| find_cookie_db(base, n).is_some())
+        .collect()
+}
+
+/// 枚举要扫描的 profile：
+/// - `Local State` 可读：`profile.info` 的 key 集合（含 "Default"），
+///   `last_used` 优先；
+/// - 不可读（EPERM 等权限拒绝记为 TCC 强信号）或解析失败：回退探测已知命名。
+fn list_profiles(base: &Path) -> ProfileScan {
+    match std::fs::read_to_string(base.join("Local State")) {
+        Ok(txt) => match profiles_from_local_state(&txt) {
+            Some(profiles) => ProfileScan {
+                profiles,
+                local_state_denied: false,
+            },
+            None => ProfileScan {
+                profiles: probe_known_profiles(base),
+                local_state_denied: false,
+            },
+        },
+        Err(e) => ProfileScan {
+            profiles: probe_known_profiles(base),
+            local_state_denied: e.kind() == std::io::ErrorKind::PermissionDenied,
+        },
+    }
 }
 
 /// Cookies 数据库的有序候选路径。Chromium 各分支布局不一致：
@@ -347,7 +453,12 @@ fn find_cookie_db(base: &Path, profile: &str) -> Option<PathBuf> {
 
 /// 复制 Cookies(+wal/shm) 到临时目录并以 SQLite 打开。
 /// 用读写方式打开我们自己拥有的副本（让 SQLite 完成 WAL 恢复），随后 query_only。
-fn open_cookie_copy(src: &Path) -> Result<(rusqlite::Connection, TempDirGuard), ImportError> {
+/// 复制源文件被权限拒绝（TCC）→ `E_BROWSER_DATA_TCC_DENIED`，一次失败即返回。
+fn open_cookie_copy(
+    src: &Path,
+    browser_name: &str,
+    local_state_denied: bool,
+) -> Result<(rusqlite::Connection, TempDirGuard), ImportError> {
     let tmp = std::env::temp_dir().join(format!(
         "fama-cookies-{}-{}",
         std::process::id(),
@@ -364,9 +475,11 @@ fn open_cookie_copy(src: &Path) -> Result<(rusqlite::Connection, TempDirGuard), 
         let from = src.with_file_name(format!("Cookies{suffix}"));
         if from.exists() {
             if let Err(e) = std::fs::copy(&from, dst.with_file_name(format!("Cookies{suffix}"))) {
-                return Err(ImportError::new(
-                    E_COOKIE_DB_LOCKED,
-                    format!("复制 Cookies 数据库失败: {e}"),
+                return Err(browser_read_err(
+                    &e,
+                    browser_name,
+                    "复制 Cookies 数据库失败",
+                    local_state_denied,
                 ));
             }
         }
@@ -475,6 +588,117 @@ fn read_and_decrypt(
         });
     }
     Ok((matched, skipped_decrypt, skipped_other, cookies))
+}
+
+// ---------- 多 profile 扫描与合并 ----------
+
+/// 合并一条 cookie：按 (host_key, name) 去重，重复（跨 profile 常见）只保留
+/// 先扫描到的（扫描顺序靠前的 profile 优先）。`seen` 为已占用键集合。
+fn push_dedup(
+    cookies: &mut Vec<RawCookie>,
+    seen: &mut HashSet<(String, String)>,
+    c: RawCookie,
+) {
+    if seen.insert((c.host_key.clone(), c.name.clone())) {
+        cookies.push(c);
+    }
+}
+
+/// 多 profile 扫描的聚合结果
+#[derive(Debug)]
+struct ScanOutcome {
+    /// 实际定位到 Cookies 数据库并读取的 profile 目录名
+    profiles_scanned: Vec<String>,
+    /// 各 profile host 匹配行数之和
+    matched: usize,
+    skipped_decrypt: usize,
+    skipped_other: usize,
+    /// (host_key, name) 去重合并后的 cookie
+    cookies: Vec<RawCookie>,
+}
+
+/// 逐 profile 扫描：定位 DB（同一 DB 路径只读一次——根目录布局会被多个
+/// profile 的候选命中）→ 副本读取 → host 过滤 + 解密 → (host, name) 合并。
+///
+/// 失败策略：TCC 权限拒绝立即整体失败（不重试）；单个 profile 的其他失败
+/// （如 DB 损坏 / 锁）跳过、不影响其余 profile；一个都没读成才返回记录到的
+/// 首个错误。任何 DB 都未命中时，若 `Local State` 也被权限拒绝则报 TCC
+/// （强信号），否则报 `E_BROWSER_DATA_MISSING`。
+fn scan_all_profiles(
+    base: &Path,
+    scan: &ProfileScan,
+    browser_name: &str,
+    key: &[u8; 16],
+    site_hosts: &[String],
+) -> Result<ScanOutcome, ImportError> {
+    let mut out = ScanOutcome {
+        profiles_scanned: Vec::new(),
+        matched: 0,
+        skipped_decrypt: 0,
+        skipped_other: 0,
+        cookies: Vec::new(),
+    };
+    let mut seen_dbs: HashSet<PathBuf> = HashSet::new();
+    let mut seen_keys: HashSet<(String, String)> = HashSet::new();
+    let mut read_ok_any = false;
+    let mut first_err: Option<ImportError> = None;
+
+    for profile in &scan.profiles {
+        let Some(db) = find_cookie_db(base, profile) else { continue };
+        if !seen_dbs.insert(db.clone()) {
+            continue;
+        }
+        out.profiles_scanned.push(profile.clone());
+        let (conn, _guard) = match open_cookie_copy(&db, browser_name, scan.local_state_denied) {
+            Ok(v) => v,
+            // TCC：一次失败即整体返回
+            Err(e) if e.code == E_BROWSER_DATA_TCC_DENIED => return Err(e),
+            // 单 profile 失败不影响其他 profile
+            Err(e) => {
+                first_err.get_or_insert(e);
+                continue;
+            }
+        };
+        match read_and_decrypt(&conn, key, site_hosts) {
+            Ok((matched, skipped_decrypt, skipped_other, cookies)) => {
+                read_ok_any = true;
+                out.matched += matched;
+                out.skipped_decrypt += skipped_decrypt;
+                out.skipped_other += skipped_other;
+                for c in cookies {
+                    push_dedup(&mut out.cookies, &mut seen_keys, c);
+                }
+            }
+            Err(e) => {
+                first_err.get_or_insert(e);
+            }
+        }
+    }
+
+    if out.profiles_scanned.is_empty() {
+        return Err(if scan.local_state_denied {
+            // Local State 与全部候选 DB 都探测不到内容，权限拒绝是强信号
+            tcc_denied(browser_name, "Local State 与 Cookies 数据库")
+        } else {
+            ImportError::new(
+                E_BROWSER_DATA_MISSING,
+                format!(
+                    "未找到 {} 的 Cookies 数据库（已按 profile 依次探测 {} 下各 profile 的 \
+                     Cookies / Network/Cookies 与数据根目录候选；可能尚未在任何 profile \
+                     登录过站点）",
+                    browser_name,
+                    base.display()
+                ),
+            )
+        });
+    }
+    if !read_ok_any {
+        // 命中过 DB 但全部读取失败：报首个具体错误
+        return Err(first_err.unwrap_or_else(|| {
+            ImportError::new(E_BROWSER_DATA_MISSING, "Cookies 数据库读取失败")
+        }));
+    }
+    Ok(out)
 }
 
 // ---------- 注入 WKHTTPCookieStore ----------
@@ -605,9 +829,11 @@ fn inject_cookies(
 pub struct ImportReport {
     /// 导入来源浏览器名
     pub browser: String,
-    /// 使用的浏览器 profile 目录名
+    /// 首个扫描的浏览器 profile 目录名（兼容字段；完整列表见 profiles_scanned）
     pub profile: String,
-    /// host 匹配到的 cookie 行数
+    /// 实际定位到 Cookies 数据库并扫描的全部 profile 目录名
+    pub profiles_scanned: Vec<String>,
+    /// host 匹配到的 cookie 行数（跨 profile 求和）
     pub matched: usize,
     /// 成功注入的条数
     pub injected: usize,
@@ -641,7 +867,7 @@ pub fn import(app: &AppHandle<Wry>, targets: &[SiteConfig]) -> Result<ImportRepo
     // 2. Keychain 读取 + 派生 key（有本次运行缓存）
     let key = derived_key_for(browser)?;
 
-    // 3. 定位 Cookies 数据库
+    // 3. 定位用户数据目录（TCC 下元数据访问仍可用，is_dir 不会被拦截）
     let base = app
         .path()
         .home_dir()
@@ -654,37 +880,27 @@ pub fn import(app: &AppHandle<Wry>, targets: &[SiteConfig]) -> Result<ImportRepo
             format!("未找到 {} 的用户数据目录 {}", browser.name, base.display()),
         ));
     }
-    let profile = last_used_profile(&base);
-    let cookies_db = find_cookie_db(&base, &profile).ok_or_else(|| {
-        ImportError::new(
-            E_BROWSER_DATA_MISSING,
-            format!(
-                "未找到 {} 的 Cookies 数据库（已探测 profile 目录与数据根目录下的 \
-                 Cookies / Network/Cookies；profile {} 可能尚未登录过任何站点）",
-                browser.name, profile
-            ),
-        )
-    })?;
 
-    // 4. 副本查询 + host 过滤 + 解密
+    // 4. 多 profile 枚举 + 逐一扫描（副本查询 + host 过滤 + 解密 + 去重合并）。
+    //    TCC 权限拒绝（Local State / Cookies 复制 EPERM）在这里以
+    //    E_BROWSER_DATA_TCC_DENIED 一次失败即返回。
     let site_hosts: Vec<String> = targets
         .iter()
         .filter_map(|t| t.url.host_str().map(|h| h.to_string()))
         .collect();
-    let (matched, skipped_decrypt, skipped_other, cookies) = {
-        let (conn, _guard) = open_cookie_copy(&cookies_db)?;
-        read_and_decrypt(&conn, &key, &site_hosts)?
-    };
+    let scan = list_profiles(&base);
+    let outcome = scan_all_profiles(&base, &scan, browser.name, &key, &site_hosts)?;
 
     // 5. 注入默认 data store（所有站点 webview 共享，见 design.md §2.5）
-    let (injected, skipped_build) = inject_cookies(app, cookies)?;
-    let skipped_other = skipped_other + skipped_build;
+    let (injected, skipped_build) = inject_cookies(app, outcome.cookies)?;
+    let skipped_other = outcome.skipped_other + skipped_build;
 
-    if matched > 0 && injected == 0 && skipped_decrypt == matched {
+    if outcome.matched > 0 && injected == 0 && outcome.skipped_decrypt == outcome.matched {
         return Err(ImportError::new(
             E_DECRYPT_FAILED,
             format!(
-                "匹配到 {matched} 条 cookie 但全部解密失败（浏览器可能启用了新的加密方案）"
+                "匹配到 {} 条 cookie 但全部解密失败（浏览器可能启用了新的加密方案）",
+                outcome.matched
             ),
         ));
     }
@@ -695,10 +911,15 @@ pub fn import(app: &AppHandle<Wry>, targets: &[SiteConfig]) -> Result<ImportRepo
 
     Ok(ImportReport {
         browser: browser.name.to_string(),
-        profile,
-        matched,
+        profile: outcome
+            .profiles_scanned
+            .first()
+            .cloned()
+            .unwrap_or_else(|| "Default".to_string()),
+        profiles_scanned: outcome.profiles_scanned,
+        matched: outcome.matched,
         injected,
-        skipped_decrypt,
+        skipped_decrypt: outcome.skipped_decrypt,
         skipped_other,
         reloaded,
     })
@@ -832,31 +1053,31 @@ mod tests {
         assert_eq!(chromium_utc_to_unix_secs(13_348_540_800_000_000), 1_704_067_200.0);
     }
 
+    /// Chromium cookies 表的最小真实 schema（read_and_decrypt 与 write_cookies_db 共用）
+    const COOKIES_SCHEMA: &str = "CREATE TABLE cookies (
+        creation_utc INTEGER NOT NULL,
+        host_key TEXT NOT NULL,
+        top_frame_site_key TEXT NOT NULL DEFAULT '',
+        name TEXT NOT NULL,
+        value TEXT NOT NULL DEFAULT '',
+        encrypted_value BLOB DEFAULT '',
+        path TEXT NOT NULL DEFAULT '/',
+        expires_utc INTEGER NOT NULL DEFAULT 0,
+        is_secure INTEGER NOT NULL DEFAULT 0,
+        is_httponly INTEGER NOT NULL DEFAULT 0,
+        last_access_utc INTEGER NOT NULL DEFAULT 0,
+        has_expires INTEGER NOT NULL DEFAULT 1,
+        is_persistent INTEGER NOT NULL DEFAULT 1,
+        priority INTEGER NOT NULL DEFAULT 1,
+        samesite INTEGER NOT NULL DEFAULT -1
+    );";
+
     /// 用 Chromium 真实 schema 造一个 Cookies 库，端到端验证 read_and_decrypt：
     /// host 过滤、v10 解密、明文 value 回退、过期剔除。
     #[test]
     fn read_and_decrypt_end_to_end() {
         let conn = rusqlite::Connection::open_in_memory().unwrap();
-        conn.execute_batch(
-            "CREATE TABLE cookies (
-                creation_utc INTEGER NOT NULL,
-                host_key TEXT NOT NULL,
-                top_frame_site_key TEXT NOT NULL DEFAULT '',
-                name TEXT NOT NULL,
-                value TEXT NOT NULL DEFAULT '',
-                encrypted_value BLOB DEFAULT '',
-                path TEXT NOT NULL DEFAULT '/',
-                expires_utc INTEGER NOT NULL DEFAULT 0,
-                is_secure INTEGER NOT NULL DEFAULT 0,
-                is_httponly INTEGER NOT NULL DEFAULT 0,
-                last_access_utc INTEGER NOT NULL DEFAULT 0,
-                has_expires INTEGER NOT NULL DEFAULT 1,
-                is_persistent INTEGER NOT NULL DEFAULT 1,
-                priority INTEGER NOT NULL DEFAULT 1,
-                samesite INTEGER NOT NULL DEFAULT -1
-            );",
-        )
-        .unwrap();
+        conn.execute_batch(COOKIES_SCHEMA).unwrap();
 
         let key = *derive_cookie_key(b"peanuts");
         // 2099 年（chromium epoch 微秒）作为"未过期"
@@ -1023,5 +1244,352 @@ mod tests {
         // 只建同名目录不建文件：目录不算候选
         std::fs::create_dir_all(tmp.0.join("Default/Cookies")).unwrap();
         assert_eq!(find_cookie_db(&tmp.0, "Default"), None);
+    }
+
+    // ---------- TCC / 权限拒绝错误分类 ----------
+
+    /// EPERM(1) / EACCES(13) / 显式 PermissionDenied → E_BROWSER_DATA_TCC_DENIED；
+    /// 其他 io 错误仍归 E_COOKIE_DB_LOCKED 并保留 action 上下文
+    #[test]
+    fn browser_read_err_maps_permission_denied_to_tcc() {
+        for raw in [1, 13] {
+            let e = std::io::Error::from_raw_os_error(raw);
+            assert_eq!(e.kind(), std::io::ErrorKind::PermissionDenied);
+            let err = browser_read_err(&e, "Edge", "复制 Cookies 数据库失败", false);
+            assert_eq!(err.code, E_BROWSER_DATA_TCC_DENIED);
+        }
+        let e = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "denied");
+        let err = browser_read_err(&e, "Edge", "复制 Cookies 数据库失败", false);
+        assert_eq!(err.code, E_BROWSER_DATA_TCC_DENIED);
+
+        let err = browser_read_err(
+            &std::io::Error::from_raw_os_error(2),
+            "Edge",
+            "复制 Cookies 数据库失败",
+            false,
+        );
+        assert_eq!(err.code, E_COOKIE_DB_LOCKED);
+        assert!(err.message.contains("复制 Cookies 数据库失败"));
+    }
+
+    /// TCC 提示必须带分步授权指引；Local State 同被拦截时合并提示
+    #[test]
+    fn tcc_denied_message_gives_actionable_guidance() {
+        let err = tcc_denied("Edge", "Cookies 数据库");
+        assert_eq!(err.code, E_BROWSER_DATA_TCC_DENIED);
+        for kw in ["Edge", "TCC", "完全磁盘访问", "终端", "fama.app", "重启"] {
+            assert!(
+                err.message.contains(kw),
+                "提示缺少关键词 {kw}：{}",
+                err.message
+            );
+        }
+        let err = browser_read_err(
+            &std::io::Error::new(std::io::ErrorKind::PermissionDenied, "x"),
+            "Edge",
+            "复制 Cookies 数据库失败",
+            true,
+        );
+        assert_eq!(err.code, E_BROWSER_DATA_TCC_DENIED);
+        assert!(err.message.contains("Local State"));
+    }
+
+    // ---------- 多 profile 枚举 ----------
+
+    #[test]
+    fn profiles_from_local_state_orders_last_used_first() {
+        // last_used 优先，其余按字典序
+        let txt = r#"{"profile":{"last_used":"Profile 1","info":{"Profile 1":{},"Default":{}}}}"#;
+        assert_eq!(
+            profiles_from_local_state(txt).unwrap(),
+            vec!["Profile 1".to_string(), "Default".to_string()]
+        );
+        // 无 last_used：字典序
+        let txt = r#"{"profile":{"info":{"Profile 2":{},"Default":{}}}}"#;
+        assert_eq!(
+            profiles_from_local_state(txt).unwrap(),
+            vec!["Default".to_string(), "Profile 2".to_string()]
+        );
+        // info 缺 "Default"：补上（惯例的默认 profile 目录）
+        let txt = r#"{"profile":{"info":{"Profile 2":{}}}}"#;
+        assert_eq!(
+            profiles_from_local_state(txt).unwrap(),
+            vec!["Default".to_string(), "Profile 2".to_string()]
+        );
+        // last_used 不在 info 集合里：忽略，不进列表
+        let txt = r#"{"profile":{"last_used":"Ghost","info":{"Default":{}}}}"#;
+        assert_eq!(
+            profiles_from_local_state(txt).unwrap(),
+            vec!["Default".to_string()]
+        );
+        // 坏 JSON / 无 profile.info / info 为空 → None（调用方回退探测）
+        assert!(profiles_from_local_state("not json").is_none());
+        assert!(profiles_from_local_state(r#"{"profile":{}}"#).is_none());
+        assert!(profiles_from_local_state(r#"{"profile":{"info":{}}}"#).is_none());
+    }
+
+    #[test]
+    fn list_profiles_reads_local_state_when_allowed() {
+        let tmp = make_tmp_dir("ls-ok");
+        std::fs::write(
+            tmp.0.join("Local State"),
+            r#"{"profile":{"last_used":"Profile 1","info":{"Default":{},"Profile 1":{}}}}"#,
+        )
+        .unwrap();
+        let scan = list_profiles(&tmp.0);
+        assert!(!scan.local_state_denied);
+        assert_eq!(
+            scan.profiles,
+            vec!["Profile 1".to_string(), "Default".to_string()]
+        );
+    }
+
+    /// Local State 被权限拒绝（用 mode 000 模拟 TCC 的 EACCES/EPERM）→
+    /// 回退探测已知命名，只保留命中 Cookies 候选的 profile。
+    /// root 进程不受 mode 位约束，此环境下跳过。
+    #[test]
+    fn list_profiles_denied_local_state_falls_back_to_probe() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = make_tmp_dir("ls-denied");
+        let ls = tmp.0.join("Local State");
+        std::fs::write(&ls, r#"{"profile":{"last_used":"Profile 1"}}"#).unwrap();
+        std::fs::set_permissions(&ls, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::read_to_string(&ls).is_ok() {
+            return; // 特权环境无法模拟权限拒绝
+        }
+        touch(&tmp.0.join("Default/Network/Cookies"));
+        touch(&tmp.0.join("Profile 3/Cookies"));
+        let scan = list_profiles(&tmp.0);
+        assert!(scan.local_state_denied);
+        assert_eq!(
+            scan.profiles,
+            vec!["Default".to_string(), "Profile 3".to_string()]
+        );
+    }
+
+    // ---------- (host, name) 去重合并 ----------
+
+    fn mk_cookie(host: &str, name: &str, value: &str) -> RawCookie {
+        RawCookie {
+            host_key: host.to_string(),
+            name: name.to_string(),
+            value: value.to_string(),
+            path: "/".to_string(),
+            expires_utc: 0,
+            has_expires: false,
+            is_secure: false,
+            is_httponly: false,
+            samesite: -1,
+        }
+    }
+
+    #[test]
+    fn push_dedup_keeps_first_by_host_and_name() {
+        let mut cookies = Vec::new();
+        let mut seen = HashSet::new();
+        push_dedup(
+            &mut cookies,
+            &mut seen,
+            mk_cookie(".kimi.com", "session", "first"),
+        );
+        // 跨 profile 的重复 (host, name)：丢弃后到者
+        push_dedup(
+            &mut cookies,
+            &mut seen,
+            mk_cookie(".kimi.com", "session", "second"),
+        );
+        // 同 host 不同名：保留
+        push_dedup(&mut cookies, &mut seen, mk_cookie(".kimi.com", "pref", "zh"));
+        // 同名不同 host：保留
+        push_dedup(
+            &mut cookies,
+            &mut seen,
+            mk_cookie("kimi.com", "session", "host-only"),
+        );
+        assert_eq!(cookies.len(), 3);
+        assert_eq!(cookies[0].value, "first");
+    }
+
+    // ---------- scan_all_profiles ----------
+
+    /// 在 path 建一个带 v10 加密行的真实 schema Cookies 库
+    fn write_cookies_db(path: &Path, key: &[u8; 16], rows: &[(&str, &str, &str)]) {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        let conn = rusqlite::Connection::open(path).unwrap();
+        conn.execute_batch(COOKIES_SCHEMA).unwrap();
+        // 2099 年（chromium epoch 微秒）作为"未过期"
+        let far_future: i64 = (4_102_444_800 + 11_644_473_600) * 1_000_000;
+        for (host, name, value) in rows {
+            conn.execute(
+                "INSERT INTO cookies (creation_utc, host_key, name, value, encrypted_value, \
+                 path, expires_utc, is_secure, is_httponly, has_expires, samesite) \
+                 VALUES (0, ?1, ?2, '', ?3, '/', ?4, 1, 1, 1, 1)",
+                rusqlite::params![host, name, encrypt_v10(key, value.as_bytes()), far_future],
+            )
+            .unwrap();
+        }
+    }
+
+    fn scan_plan(profiles: &[&str], local_state_denied: bool) -> ProfileScan {
+        ProfileScan {
+            profiles: profiles.iter().map(|p| p.to_string()).collect(),
+            local_state_denied,
+        }
+    }
+
+    /// 两个 profile 各有 Cookies 库：逐一读取、计数求和、(host, name) 去重，
+    /// 先扫描的 profile（Default）优先保留同名 cookie
+    #[test]
+    fn scan_all_profiles_merges_profiles_with_dedup() {
+        let tmp = make_tmp_dir("multi");
+        let key = *derive_cookie_key(b"peanuts");
+        write_cookies_db(
+            &tmp.0.join("Default/Cookies"),
+            &key,
+            &[
+                (".kimi.com", "session", "tok-default"),
+                (".kimi.com", "pref", "zh"),
+            ],
+        );
+        write_cookies_db(
+            &tmp.0.join("Profile 1/Cookies"),
+            &key,
+            &[
+                (".kimi.com", "session", "tok-profile1"),
+                (".chatgpt.com", "sess", "g"),
+            ],
+        );
+        let hosts = vec!["www.kimi.com".to_string(), "chatgpt.com".to_string()];
+        let out = scan_all_profiles(&tmp.0, &scan_plan(&["Default", "Profile 1"], false), "Edge", &key, &hosts)
+            .unwrap();
+        assert_eq!(
+            out.profiles_scanned,
+            vec!["Default".to_string(), "Profile 1".to_string()]
+        );
+        assert_eq!(out.matched, 4); // Default 2 条 + Profile 1 的 2 条（含跨 profile 重复）
+        assert_eq!(out.cookies.len(), 3); // (host, name) 去重后
+        let session = out
+            .cookies
+            .iter()
+            .find(|c| c.host_key == ".kimi.com" && c.name == "session")
+            .unwrap();
+        assert_eq!(session.value, "tok-default");
+    }
+
+    /// 单个 profile 的 DB 损坏（查询失败）只跳过该 profile，不影响其余
+    #[test]
+    fn scan_all_profiles_isolates_per_profile_failure() {
+        let tmp = make_tmp_dir("iso");
+        let key = *derive_cookie_key(b"peanuts");
+        // 垃圾字节：副本能打开但查询 cookies 表失败
+        touch(&tmp.0.join("Default/Cookies"));
+        write_cookies_db(
+            &tmp.0.join("Profile 1/Cookies"),
+            &key,
+            &[(".kimi.com", "session", "tok")],
+        );
+        let out = scan_all_profiles(
+            &tmp.0,
+            &scan_plan(&["Default", "Profile 1"], false),
+            "Edge",
+            &key,
+            &["www.kimi.com".to_string()],
+        )
+        .unwrap();
+        assert_eq!(out.profiles_scanned.len(), 2); // 两个 DB 都命中并尝试
+        assert_eq!(out.cookies.len(), 1);
+        assert_eq!(out.cookies[0].value, "tok");
+    }
+
+    /// 全部 profile 读取失败 → 返回首个具体错误
+    #[test]
+    fn scan_all_profiles_all_failed_returns_first_error() {
+        let tmp = make_tmp_dir("allfail");
+        touch(&tmp.0.join("Default/Cookies"));
+        touch(&tmp.0.join("Profile 1/Cookies"));
+        let err = scan_all_profiles(
+            &tmp.0,
+            &scan_plan(&["Default", "Profile 1"], false),
+            "Edge",
+            &[0u8; 16],
+            &[],
+        )
+        .unwrap_err();
+        assert_eq!(err.code, E_COOKIE_DB_LOCKED);
+    }
+
+    /// Opera 式根目录布局：多个 profile 的候选解析到同一根目录 DB，只读一次
+    #[test]
+    fn scan_all_profiles_reads_shared_root_db_once() {
+        let tmp = make_tmp_dir("opera-root");
+        let key = *derive_cookie_key(b"peanuts");
+        write_cookies_db(
+            &tmp.0.join("Cookies"),
+            &key,
+            &[(".kimi.com", "session", "tok")],
+        );
+        let out = scan_all_profiles(
+            &tmp.0,
+            &scan_plan(&["Default", "Profile 1"], false),
+            "Opera",
+            &key,
+            &["www.kimi.com".to_string()],
+        )
+        .unwrap();
+        assert_eq!(out.profiles_scanned, vec!["Default".to_string()]);
+        assert_eq!(out.matched, 1);
+    }
+
+    /// 复制 Cookies DB 被权限拒绝（mode 000 模拟 TCC）→ 立即整体失败，
+    /// 且 Local State 同被拒时提示里合并该信号。root 环境跳过。
+    #[test]
+    fn scan_all_profiles_fails_fast_on_denied_copy() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = make_tmp_dir("tcc");
+        let key = *derive_cookie_key(b"peanuts");
+        let db = tmp.0.join("Default/Cookies");
+        write_cookies_db(&db, &key, &[(".kimi.com", "session", "tok")]);
+        std::fs::set_permissions(&db, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::read(&db).is_ok() {
+            return; // 特权环境无法模拟权限拒绝
+        }
+        let err = scan_all_profiles(
+            &tmp.0,
+            &scan_plan(&["Default"], true),
+            "Edge",
+            &key,
+            &["www.kimi.com".to_string()],
+        )
+        .unwrap_err();
+        assert_eq!(err.code, E_BROWSER_DATA_TCC_DENIED);
+        assert!(err.message.contains("Local State"));
+    }
+
+    /// 任何 DB 都没探测到：Local State 也被权限拒绝 → TCC（强信号）；
+    /// 否则 → E_BROWSER_DATA_MISSING
+    #[test]
+    fn scan_all_profiles_no_db_reports_tcc_or_missing() {
+        let tmp = make_tmp_dir("nodb");
+        let err = scan_all_profiles(
+            &tmp.0,
+            &scan_plan(&["Default", "Profile 1"], true),
+            "Edge",
+            &[0u8; 16],
+            &[],
+        )
+        .unwrap_err();
+        assert_eq!(err.code, E_BROWSER_DATA_TCC_DENIED);
+
+        let err = scan_all_profiles(
+            &tmp.0,
+            &scan_plan(&["Default", "Profile 1"], false),
+            "Edge",
+            &[0u8; 16],
+            &[],
+        )
+        .unwrap_err();
+        assert_eq!(err.code, E_BROWSER_DATA_MISSING);
     }
 }

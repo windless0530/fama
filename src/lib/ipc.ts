@@ -49,7 +49,10 @@ export interface Round {
 // 浏览器登录态导入报告（commands.rs import_browser_session 的契约）
 export interface ImportReport {
   browser: string;
+  /** 首个扫描的 profile（兼容字段；完整列表见 profilesScanned） */
   profile: string;
+  /** 实际定位到 Cookies 数据库并扫描的全部 profile 目录名 */
+  profilesScanned: string[];
   matched: number;
   injected: number;
   skippedDecrypt: number;

@@ -15,6 +15,7 @@ use crate::sites::SiteConfig;
 pub struct ImportReport {
     pub browser: String,
     pub profile: String,
+    pub profiles_scanned: Vec<String>,
     pub matched: usize,
     pub injected: usize,
     pub skipped_decrypt: usize,

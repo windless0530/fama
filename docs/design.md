@@ -225,10 +225,12 @@ App 与系统浏览器默认互相隔离，新装机后各站点需要重新登�
 
 - **范围（有意收窄）**：仅支持 Chromium 系默认浏览器（Chrome / Edge / Brave / Vivaldi / Opera / Chromium）。读取其 `"<Browser> Safe Storage"` 钥匙串条目派生解密 key（PBKDF2-HMAC-SHA1 → AES-128-CBC，Chromium v10 格式），以临时副本只读查询 Cookies 数据库，**只导入已配置站点 host 匹配的 cookie**，注入 `WKWebsiteDataStore.defaultDataStore().httpCookieStore`，并 reload 已加载的站点页面。
 - **双重授权**：① 前端确认框说明范围与风险；② macOS Keychain ACL 弹窗（系统在 app 首次读取该条目时弹出）。任一拒绝即干净失败，不自动重试；派生 key 缓存在本次进程内存，重复导入不再弹 Keychain。
+- **硬前提（macOS TCC / 完全磁盘访问）**：Chromium 系浏览器的用户数据目录受 macOS 隐私保护（TCC）——fama 进程读取 `Local State` / `Cookies` 文件内容会得到 EPERM/EACCES（但 `stat` / `is_file()` 元数据探测不受影响）。因此导入前必须给运行环境授权：「系统设置 → 隐私与安全性 → 完全磁盘访问」——开发模式（`npm run tauri dev`）给运行它的终端 App（如 iTerm2 / Terminal）授权，安装版给 fama.app 授权；授权后完全退出并重启该 App。未授权时导入报 `E_BROWSER_DATA_TCC_DENIED`（含上述指引），一次失败即返回、不重试。
+- **多 profile 扫描**：`Local State` 可读时取 `profile.info` 的 key 集合（保证含 `Default`）、`last_used` 优先；不可读（TCC 拒绝）时回退探测已知命名 `Default`、`Profile 1..9`（`is_file()` 元数据探测仍可用）。对所有定位到 Cookies DB 的 profile 逐一副本读取、过滤解密，结果按 (host_key, name) 去重合并（先扫描的 profile 优先；同一 DB 路径只读一次，兼容 Opera 根目录布局）；单个 profile 解密 / 读取失败跳过、不影响其余，全部失败才报错。
 - **明确不做**：Safari（TCC / ACL 限制，第三方 WKWebView app 无法稳定读取）、Firefox（无 Safe Storage 机制）、浏览器密码库（Login Data）。检测到这三类默认浏览器直接报 `E_UNSUPPORTED_BROWSER`，不触发 Keychain。
 - **数据安全**：Safe Storage 原始 secret 读出即 zeroize；Cookies DB 副本放在临时目录、任何退出路径删除；解密后的 cookie 只注入本 app 自己的 WebKit 数据容器（defaultDataStore，仅本 app 可见），不做中间落盘——但带有效期的 cookie 可能由 WebKit 持久化到本机容器内，与在 app 里正常登录产生的 cookie 行为一致。
 - **平台**：Windows（DPAPI）/ Linux（Secret Service）等价能力不在 v1 范围，非 macOS 返回 `E_UNSUPPORTED_PLATFORM`。
-- **已知限制**：`NSHTTPCookie` 无法完整表达部分 cookie 属性（HttpOnly / SameSite=None 借助 Foundation 私有属性键尽量保留）；profile 取 `Local State.profile.last_used`（回退 `Default`），Cookies DB 按候选顺序探测 `{profile}/Cookies` → `{profile}/Network/Cookies` → 数据根 `Cookies` → 数据根 `Network/Cookies`（兼容 Chrome 新版 `Network/` 迁移与 Opera 稳定版无 profile 子目录的布局），多 profile 精选择为后续增强；Chromium 未来若更换加密方案（如 v20 app-bound），表现为 skipped 增多并在报告中可见。
+- **已知限制**：`NSHTTPCookie` 无法完整表达部分 cookie 属性（HttpOnly / SameSite=None 借助 Foundation 私有属性键尽量保留）；Cookies DB 按候选顺序探测 `{profile}/Cookies` → `{profile}/Network/Cookies` → 数据根 `Cookies` → 数据根 `Network/Cookies`（兼容 Chrome 新版 `Network/` 迁移与 Opera 稳定版无 profile 子目录的布局）；Chromium 未来若更换加密方案（如 v20 app-bound），表现为 skipped 增多并在报告中可见。
 
 ## 3. 数据库设计（store.rs）
 
@@ -287,13 +289,14 @@ interface Round       { id: number; question: string; createdAt: number; targets
 | `import_browser_session` | `(siteIds) → ImportReport` | 从默认 Chromium 系浏览器导入登录 cookie（§2.5.1）；siteIds 为空=全部站点 |
 | `write_clipboard` | `(text) → void` | 降级路径（仅注入失败时调用） |
 
-错误码（invoke reject 的 `code` 字段）：`E_SITES_CONFIG` / `E_TAB_CREATE` / `E_TAB_NOT_READY` / `E_INJECT_TIMEOUT` / `E_INJECT_SCRIPT` / `E_DB`；导入相关：`E_NO_SITES` / `E_DETECT_FAILED` / `E_UNSUPPORTED_BROWSER` / `E_KEYCHAIN_NOT_FOUND` / `E_KEYCHAIN_DENIED` / `E_BROWSER_DATA_MISSING` / `E_COOKIE_DB_LOCKED` / `E_DECRYPT_FAILED` / `E_INJECT_FAILED` / `E_UNSUPPORTED_PLATFORM`。
+错误码（invoke reject 的 `code` 字段）：`E_SITES_CONFIG` / `E_TAB_CREATE` / `E_TAB_NOT_READY` / `E_INJECT_TIMEOUT` / `E_INJECT_SCRIPT` / `E_DB`；导入相关：`E_NO_SITES` / `E_DETECT_FAILED` / `E_UNSUPPORTED_BROWSER` / `E_KEYCHAIN_NOT_FOUND` / `E_KEYCHAIN_DENIED` / `E_BROWSER_DATA_MISSING` / `E_BROWSER_DATA_TCC_DENIED` / `E_COOKIE_DB_LOCKED` / `E_DECRYPT_FAILED` / `E_INJECT_FAILED` / `E_UNSUPPORTED_PLATFORM`。
 
 ```ts
 interface ImportReport {
   browser: string          // 导入来源浏览器名
-  profile: string          // 浏览器 profile 目录名
-  matched: number          // host 匹配到的 cookie 行数
+  profile: string          // 首个扫描的 profile 目录名（兼容字段）
+  profilesScanned: string[] // 实际定位到 Cookies 数据库并扫描的全部 profile
+  matched: number          // host 匹配到的 cookie 行数（跨 profile 求和）
   injected: number         // 成功注入条数
   skippedDecrypt: number   // 解密失败（非 v10 等）
   skippedOther: number     // 过期 / 非 UTF-8 等
