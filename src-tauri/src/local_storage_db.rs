@@ -321,7 +321,8 @@ pub(crate) struct LsEntry {
 /// localStorage 读取的失败分类（调用方映射到既有错误码体系）
 #[derive(Debug)]
 pub(crate) enum LsError {
-    /// 目录不存在（profile 无 localStorage 数据，非错误语义由调用方判断）
+    /// 目录 / 文件不存在（profile 无 localStorage 数据，或文件正被压缩 /
+    /// 轮换移走；非错误语义由调用方判断）
     Missing,
     /// 读取文件被权限拒绝（TCC）
     Denied(std::io::Error),
@@ -331,12 +332,44 @@ pub(crate) enum LsError {
 
 impl From<std::io::Error> for LsError {
     fn from(e: std::io::Error) -> Self {
-        match e.kind() {
-            std::io::ErrorKind::NotFound => LsError::Missing,
-            std::io::ErrorKind::PermissionDenied => LsError::Denied(e),
-            _ => LsError::Io(e),
-        }
+        classify_io_error(e)
     }
+}
+
+/// io 错误 → 读取失败分类（目录级与文件级共用）：
+/// - NotFound → Missing（跳过：浏览器压缩 / 轮换中，非错误）；
+/// - PermissionDenied → Denied（TCC：上报为 E_BROWSER_DATA_TCC_DENIED，
+///   绝不当「未登录」处理）；
+/// - 其他 → Io（按既定策略上报）。
+fn classify_io_error(e: std::io::Error) -> LsError {
+    match e.kind() {
+        std::io::ErrorKind::NotFound => LsError::Missing,
+        std::io::ErrorKind::PermissionDenied => LsError::Denied(e),
+        _ => LsError::Io(e),
+    }
+}
+
+/// 读取一个 leveldb 文件并分类失败（SSTable 与 WAL 共用）。
+/// 单文件 NotFound 跳过（Missing）；权限拒绝 / 其他 IO 错误**上报**，
+/// 不再静默当跳过——否则 TCC 缺权会被误报成「未登录」。
+fn read_leveldb_file(path: &Path) -> Result<Vec<u8>, LsError> {
+    std::fs::read(path).map_err(classify_io_error)
+}
+
+/// 列出目录下指定扩展名的文件（按路径排序）。read_dir 本身与目录项迭代
+/// 错误都显式传播（不再 filter_map 静默丢弃）。
+fn list_dir_files(dir: &Path, exts: &[&str]) -> Result<Vec<std::path::PathBuf>, LsError> {
+    let mut out: Vec<std::path::PathBuf> = std::fs::read_dir(dir)?
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .map(|e| e.path())
+        .filter(|p| {
+            p.extension()
+                .is_some_and(|e| exts.iter().any(|x| e == std::ffi::OsStr::new(x)))
+        })
+        .collect();
+    out.sort();
+    Ok(out)
 }
 
 /// 读取 leveldb 目录中指定 origin（如 `https://www.kimi.com`）的全部
@@ -356,18 +389,13 @@ pub(crate) fn read_origin_entries(dir: &Path, origin: &str) -> Result<Vec<LsEntr
     };
 
     // SSTable 按文件名（文件号）升序
-    let mut files: Vec<std::path::PathBuf> = std::fs::read_dir(dir)?
-        .filter_map(|e| e.ok().map(|e| e.path()))
-        .filter(|p| {
-            p.extension()
-                .map(|e| e == "ldb" || e == "sst")
-                .unwrap_or(false)
-        })
-        .collect();
-    files.sort();
-    for path in &files {
-        let Ok(file) = std::fs::read(path) else {
-            continue; // 单文件读失败（极小概率 torn read）跳过
+    for path in list_dir_files(dir, &["ldb", "sst"])? {
+        let file = match read_leveldb_file(&path) {
+            Ok(f) => f,
+            // NotFound：浏览器压缩 / 轮换中移走了文件，跳过
+            Err(LsError::Missing) => continue,
+            // 权限拒绝 / 其他 IO：上报（TCC 缺权不得误报「未登录」）
+            Err(e) => return Err(e),
         };
         for (ikey, val) in parse_sstable(&file) {
             if ikey.len() < 8 {
@@ -386,14 +414,11 @@ pub(crate) fn read_origin_entries(dir: &Path, origin: &str) -> Result<Vec<LsEntr
     }
 
     // WAL 的 seq 全局递增且只在 flush 后才删，最新写入总在 .log 里
-    let mut logs: Vec<std::path::PathBuf> = std::fs::read_dir(dir)?
-        .filter_map(|e| e.ok().map(|e| e.path()))
-        .filter(|p| p.extension().map(|e| e == "log").unwrap_or(false))
-        .collect();
-    logs.sort();
-    for path in &logs {
-        let Ok(file) = std::fs::read(path) else {
-            continue;
+    for path in list_dir_files(dir, &["log"])? {
+        let file = match read_leveldb_file(&path) {
+            Ok(f) => f,
+            Err(LsError::Missing) => continue,
+            Err(e) => return Err(e),
         };
         for (user_key, val, seq) in parse_wal(&file) {
             // Some=put（空串值也合法）、None=delete
@@ -424,6 +449,19 @@ pub(crate) fn read_origin_entries(dir: &Path, origin: &str) -> Result<Vec<LsEntr
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 固定 zstd 压缩向量：zstd CLI 对 `build_block`（2 条 entry：
+    /// `_https://www.kimi.com\0\x01k` → `\x01v`、`zz` → `\x01w`）输出的
+    /// 压缩流（77 字节，magic `28 b5 2f fd`）。内嵌后测试与机器是否安装
+    /// zstd CLI 无关。
+    const ZSTD_BLOCK_FIXTURE: &[u8] = &[
+        0x28, 0xb5, 0x2f, 0xfd, 0x04, 0x58, 0x01, 0x02, 0x00, 0x00, 0x20, 0x02, 0x5f, 0x68,
+        0x74, 0x74, 0x70, 0x73, 0x3a, 0x2f, 0x2f, 0x77, 0x77, 0x77, 0x2e, 0x6b, 0x69, 0x6d,
+        0x69, 0x2e, 0x63, 0x6f, 0x6d, 0x00, 0x01, 0x6b, 0x01, 0x05, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x01, 0x76, 0x00, 0x0a, 0x02, 0x7a, 0x7a, 0x01, 0x06, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x01, 0x77, 0x00, 0x00, 0x00, 0x00, 0x25, 0x00, 0x00, 0x00, 0x02,
+        0x00, 0x00, 0x00, 0x2d, 0x73, 0x64, 0x64,
+    ];
 
     // ---------- 测试构造器：block / SSTable / WAL ----------
 
@@ -782,35 +820,91 @@ mod tests {
         }
     }
 
-    /// zstd 压缩 block 的真实解压(向量由 zstd CLI 生成,内容是 build_block 输出)
+    /// classify_io_error 纯分类:EPERM/EACCES → Denied,ENOENT → Missing,
+    /// 其他(EIO)→ Io。不依赖 OS 实际拒绝,任何环境都验证分支本身。
+    #[test]
+    fn classify_io_error_categories() {
+        assert!(matches!(
+            classify_io_error(std::io::Error::from_raw_os_error(1)), // EPERM
+            LsError::Denied(_)
+        ));
+        assert!(matches!(
+            classify_io_error(std::io::Error::from_raw_os_error(13)), // EACCES
+            LsError::Denied(_)
+        ));
+        assert!(matches!(
+            classify_io_error(std::io::Error::from(std::io::ErrorKind::PermissionDenied)),
+            LsError::Denied(_)
+        ));
+        assert!(matches!(
+            classify_io_error(std::io::Error::from_raw_os_error(2)), // ENOENT
+            LsError::Missing
+        ));
+        assert!(matches!(
+            classify_io_error(std::io::Error::from(std::io::ErrorKind::NotFound)),
+            LsError::Missing
+        ));
+        assert!(matches!(
+            classify_io_error(std::io::Error::from_raw_os_error(5)), // EIO
+            LsError::Io(_)
+        ));
+    }
+
+    /// 单个 .ldb 文件权限拒绝 → Denied,不得静默跳过(TCC 缺权被误报为
+    /// 「未登录」的正是这条路径)。root 下 chmod 不生效则显式跳过。
+    #[test]
+    fn read_origin_entries_single_ldb_denied() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = make_dir("ldb-denied");
+        let ldb = tmp.0.join("000005.ldb");
+        std::fs::write(&ldb, b"x").unwrap();
+        std::fs::set_permissions(&ldb, std::fs::Permissions::from_mode(0o000)).unwrap();
+        // root 预检:mode 000 仍可读说明 chmod 无效(root),不宣称 OS 拒绝已验证
+        if std::fs::read(&ldb).is_ok() {
+            std::fs::set_permissions(&ldb, std::fs::Permissions::from_mode(0o644)).unwrap();
+            return;
+        }
+        let res = read_origin_entries(&tmp.0, "https://www.kimi.com");
+        std::fs::set_permissions(&ldb, std::fs::Permissions::from_mode(0o644)).unwrap();
+        match res {
+            Err(LsError::Denied(_)) => {}
+            other => panic!("expected Denied, got {other:?}"),
+        }
+    }
+
+    /// 单个 .log(WAL)文件权限拒绝 → Denied,同上
+    #[test]
+    fn read_origin_entries_single_log_denied() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = make_dir("log-denied");
+        let log = tmp.0.join("000006.log");
+        std::fs::write(&log, b"x").unwrap();
+        std::fs::set_permissions(&log, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::read(&log).is_ok() {
+            std::fs::set_permissions(&log, std::fs::Permissions::from_mode(0o644)).unwrap();
+            return;
+        }
+        let res = read_origin_entries(&tmp.0, "https://www.kimi.com");
+        std::fs::set_permissions(&log, std::fs::Permissions::from_mode(0o644)).unwrap();
+        match res {
+            Err(LsError::Denied(_)) => {}
+            other => panic!("expected Denied, got {other:?}"),
+        }
+    }
+
+    /// zstd 压缩 block 的真实解压。向量由 zstd CLI 一次性生成后内嵌为固定
+    /// 字节（77 字节），测试不再依赖机器预装 zstd，也不静默跳过。
     #[test]
     fn zstd_block_roundtrip() {
-        // zstd -19 < block(6 条 entry, restart 数组) 的原始流(hex)
+        let z = ZSTD_BLOCK_FIXTURE;
+        let dec = decode_zstd(z).expect("zstd decode");
         let plain = build_block(&[
             (ikey(b"_https://www.kimi.com\0\x01k", 5, false).as_slice(), b"\x01v"),
             (ikey(b"zz", 6, false).as_slice(), b"\x01w"),
         ]);
-        let z = zstd_cli_compress(&plain);
-        let dec = decode_zstd(&z).expect("zstd decode");
         assert_eq!(dec, plain);
         let entries = parse_block_entries(&dec);
         assert_eq!(entries.len(), 2);
-    }
-
-    /// 测试内调用系统 zstd CLI 生成压缩向量(无 CLI 则跳过——CI 环境保障见
-    /// implementation report;本地 macOS 与 dev 环境均自带)
-    fn zstd_cli_compress(plain: &[u8]) -> Vec<u8> {
-        use std::io::Write;
-        use std::process::{Command, Stdio};
-        let mut child = Command::new("zstd")
-            .arg("-q")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("zstd CLI 不可用");
-        child.stdin.as_mut().unwrap().write_all(plain).unwrap();
-        child.wait_with_output().unwrap().stdout
     }
 
     /// snappy 压缩 block 的解压路径(read_block ctype=1)

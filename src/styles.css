@@ -319,6 +319,14 @@ body {
 }
 .dialog-body .err-line { color: var(--err); word-break: break-word; }
 .dialog-body .hint-line { color: var(--fg-dim); }
+.dialog-body ul.ls-sites {
+  margin: 0;
+  padding-left: 18px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.dialog-body ul.ls-sites li.bad { color: var(--err); }
 .dialog-body .actions {
   display: flex;
   justify-content: flex-end;

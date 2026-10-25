@@ -29,10 +29,10 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::sync::Mutex;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use serde::Serialize;
 use tauri::{AppHandle, Manager, Wry};
@@ -40,7 +40,9 @@ use zeroize::Zeroizing;
 
 use crate::local_storage_db::{self, LsEntry};
 use crate::sites::SiteConfig;
-use crate::tabs::Tabs;
+use crate::tabs::{
+    ls_report_from_result, ls_totals, LsFinalize, LsJobSpec, LsSiteReport, Tabs,
+};
 
 // ---------- 错误码（沿用 commands.rs 的 "E_XXX" 约定，见模块 import() 返回） ----------
 
@@ -580,8 +582,8 @@ fn open_cookie_copy(
 
 /// 查询 + host 过滤 + 解密。返回 (matched, skip 细分计数, cookies)。
 /// 每条被跳过的 cookie 在 FAMA_DEBUG_IMPORT=1 时打印原因与关键字段
-/// （expires_utc 原始值 / 换算 unix 秒 / now / 解密错误类别 / 明文前 8 字节
-/// hex），永不打印完整 value。
+/// （expires_utc 原始值 / 换算 unix 秒 / now / 解密错误类别），永不打印
+/// value 或其任何片段。
 fn read_and_decrypt(
     conn: &rusqlite::Connection,
     key: &[u8; 16],
@@ -723,15 +725,9 @@ fn read_and_decrypt(
         let value_str = match std::str::from_utf8(body) {
             Ok(s) => s.to_string(),
             Err(_) => {
+                // 红线：日志零 value 片段——只记 host/name/长度，不打明文任何部分
                 if debug_import() {
-                    // 明文前 8 字节 hex 足以判断格式，永不打印完整 value
-                    let head: Vec<String> =
-                        plain.iter().take(8).map(|b| format!("{b:02x}")).collect();
-                    ilog!(
-                        "skip utf8: host={host_key} name={name} plain_len={} plain_head=[{}]",
-                        plain.len(),
-                        head.join(" ")
-                    );
+                    ilog!("skip utf8: host={host_key} name={name} plain_len={}", plain.len());
                 }
                 skips.utf8 += 1;
                 continue;
@@ -890,14 +886,12 @@ fn scan_all_profiles(
 // 站点通过 sites.toml 的 `import_local_storage = true` 逐站点开启本路径，
 // 与 cookie 流程共用浏览器检测 / profile 枚举 / TCC 分类 / 授权模型。
 
-/// 站点 URL → localStorage origin（`scheme://host[:port]`，非默认端口才带）。
-/// LevelDB 键按 origin 精确前缀匹配（www 与裸域是不同 origin，不做子域放宽）
+/// 站点 URL → localStorage origin。直接用 tabs 的规范 origin（与浏览器
+/// `location.origin`、Chromium localStorage 键里的 origin 同形）：LevelDB
+/// 键按 origin 精确前缀匹配（www 与裸域是不同 origin，不做子域放宽），
+/// 注入侧的 origin 门禁也用同一字符串（native / 脚本内 / ACK 复核三层）。
 fn origin_of(url: &url::Url) -> Option<String> {
-    let host = url.host_str()?;
-    Some(match url.port() {
-        Some(p) => format!("{}://{host}:{p}", url.scheme()),
-        None => format!("{}://{host}", url.scheme()),
-    })
+    crate::tabs::url_origin(url)
 }
 
 /// localStorage leveldb 目录候选（有序）：profile 布局优先，数据根兜底
@@ -1005,84 +999,47 @@ fn scan_local_storage(
     Ok((out, total))
 }
 
-/// 生成在站点页面上下文执行的注入脚本：批量 `localStorage.setItem`。
-/// - 首行 `// entries: N` 注释供 tabs::ls_scripts_entry_count 计数
-///   （eval 无同步返回值，注入条数以此统计进 ImportReport）；
-/// - 键值经 serde_json 转义后内嵌，任意字符（引号/换行/非 ASCII）安全；
-/// - 每条 setItem 独立 try/catch，单键失败（如配额）不中断其余；
-/// - 注入是否生效由后续 reload + 页面登录态体现，报告/前端可见非静默。
-fn build_ls_inject_js(entries: &[LsEntry]) -> String {
+/// 注入脚本 ACK nonce 计数器（与 tabs 的任务 generation 相互独立：nonce 内嵌
+/// 脚本、generation 由任务注册分配，旧 worker 两者都对不上即作废）
+static LS_NONCE: AtomicU64 = AtomicU64::new(0);
+
+/// 生成在站点页面上下文执行的注入脚本。结果只认页面写回 URL fragment 的
+/// 真实回执（design.md §2.5.2）——eval 派发成功不算注入成功：
+/// - 先比较 `location.origin` 与预期 origin，不匹配时**不触碰 localStorage
+///   也不回执**（等待页面回到站点 origin 后由 Rust 侧重试）；
+/// - 每条 `setItem` 独立捕获异常，写入后 `getItem` 回读比对，只有写入且回读
+///   一致才计入 `written`，否则计入 `failed`（无空 catch，配额不足/被禁用
+///   等真实失败可数）；
+/// - 回执 `#fama-ls-ack=<nonce>:<percent-encoded-json>`（SPA 改 hash 不触发
+///   导航），JSON 只含 nonce、origin、attempted/written/failed、固定错误
+///   类别（"" / "write" / "script"），不含键名、值或异常原文；
+/// - 外层异常同样回执（error=script），不静默；
+/// - 键值经 serde_json 转义后内嵌，任意字符（引号/换行/非 ASCII）安全。
+fn build_ls_inject_js(entries: &[LsEntry], expected_origin: &str, nonce: u64) -> String {
     let pairs: Vec<(&str, &str)> = entries
         .iter()
         .map(|e| (e.key.as_str(), e.value.as_str()))
         .collect();
     let json = serde_json::to_string(&pairs).unwrap_or_else(|_| "[]".to_string());
+    let origin_json = serde_json::to_string(expected_origin).unwrap_or_else(|_| "\"\"".into());
     format!(
-        "// entries: {}\n(function(){{try{{var d={};\
-for(var i=0;i<d.length;i++){{try{{localStorage.setItem(d[i][0],d[i][1])}}catch(e){{}}}}\
-}}catch(e){{}}}})();",
-        entries.len(),
-        json
+        "(function(){{\
+var expected={origin_json},nonce={nonce},data={json},w=0,f=0;\
+function ack(e){{try{{history.replaceState(null,'','#fama-ls-ack='+nonce+':'+\
+encodeURIComponent(JSON.stringify({{nonce:nonce,origin:location.origin,\
+attempted:data.length,written:w,failed:f,error:e}})))}}catch(_){{}}}}\
+try{{\
+if(location.origin!==expected){{return;}}\
+for(var i=0;i<data.length;i++){{\
+try{{\
+localStorage.setItem(data[i][0],data[i][1]);\
+if(localStorage.getItem(data[i][0])===data[i][1]){{w++;}}else{{f++;}}\
+}}catch(e){{f++;}}\
+}}\
+ack(f>0?'write':'');\
+}}catch(e){{ack('script');}}\
+}})();"
     )
-}
-
-/// FAMA_DEBUG_IMPORT=1 的注入回读验证探针：把「注入的 t 个键中现存 p 个」
-/// 写进 URL fragment（SPA 改 hash 不触发导航，Rust 侧轮询 wv.url() 读回）。
-/// 只回读计数，**永不回读 value**。
-fn ls_verify_probe_js(keys: &[String]) -> String {
-    let json = serde_json::to_string(keys).unwrap_or_else(|_| "[]".to_string());
-    format!(
-        "(function(){{try{{var ks={json};var p=0,t=0;\
-for(var i=0;i<ks.length;i++){{t++;if(localStorage.getItem(ks[i])!==null)p++;}}\
-history.replaceState(null,'','#fama-ls-verify='+p+'/'+t);}}catch(e){{}}}})();"
-    )
-}
-
-/// 注入回读验证（仅 FAMA_DEBUG_IMPORT=1；kimi 是 SPA，登录与否不改变 URL，
-/// 这是不依赖 URL 的更强证据）：延迟等 reload / 首载完成，eval 探针后轮询
-/// fragment。两轮尝试覆盖页面加载慢的情况；任何失败只打日志，不影响导入
-/// 结果（线程 detached，进程正常生命周期内完成）。
-fn spawn_ls_verify(app: AppHandle<Wry>, ls_keys: Vec<(String, Vec<String>)>) {
-    std::thread::spawn(move || {
-        let tabs = app.state::<Tabs>();
-        for (site_id, keys) in &ls_keys {
-            let mut verified = false;
-            for attempt in 0..2 {
-                // 每轮先等 reload/首载推进（首轮 eval 可能被导航吞掉，次轮兜底）
-                std::thread::sleep(Duration::from_secs(6));
-                if !tabs.eval_probe_if_loaded(site_id, &ls_verify_probe_js(keys)) {
-                    ilog!(
-                        "ls verify: {site_id}: attempt {}: 页面未就绪或 eval 失败",
-                        attempt + 1
-                    );
-                    continue;
-                }
-                let deadline = Instant::now() + Duration::from_secs(4);
-                loop {
-                    if let Some(f) = tabs.url_fragment(&app, site_id) {
-                        if let Some(rest) = f.strip_prefix("fama-ls-verify=") {
-                            ilog!(
-                                "ls verify: {site_id}: present={rest}                                  （reload 后 webview localStorage 回读计数）"
-                            );
-                            verified = true;
-                            break;
-                        }
-                    }
-                    if Instant::now() >= deadline {
-                        ilog!("ls verify: {site_id}: attempt {}: 回读超时", attempt + 1);
-                        break;
-                    }
-                    std::thread::sleep(Duration::from_millis(150));
-                }
-                if verified {
-                    break;
-                }
-            }
-            if !verified {
-                ilog!("ls verify: {site_id}: 未能回读（页面加载慢或站点改写了 hash）");
-            }
-        }
-    });
 }
 
 // ---------- 注入 WKHTTPCookieStore ----------
@@ -1226,14 +1183,20 @@ pub struct ImportReport {
     pub skipped_decrypt: usize,
     /// 过期 / 非 UTF-8 等其他跳过
     pub skipped_other: usize,
-    /// 注入后触发 reload 的站点 id
+    /// 注入后触发 reload 的站点 id（cookie-only 立即 reload；localStorage
+    /// 站点在其注入确认后 reload）
     pub reloaded: Vec<String>,
+    /// localStorage 站点级结果（含挂起站点；聚合字段由它求和而来，
+    /// 单站失败不被聚合计数掩盖）
+    pub ls_sites: Vec<LsSiteReport>,
     /// localStorage 扫描读到的条目数（import_local_storage 站点，跨 profile 去重）
     pub ls_read: usize,
-    /// 已加载页面上立即 eval 注入的 localStorage 条数
+    /// 已确认写入（合法 ACK 的 written，写后回读一致）的条数
     pub ls_injected: usize,
-    /// 挂起待站点首次加载完成注入的 localStorage 条数（含在 ls_read 内）
+    /// 尚未注入（等待页面就绪 / 任务保留待重试）的条数（含在 ls_read 内）
     pub ls_pending: usize,
+    /// 确认写入失败的条数（写异常或回读不一致）
+    pub ls_failed: usize,
 }
 
 /// 完整导入流程。手动导入（🔑）调用前提：用户已在前端确认框同意（第一道授权）；
@@ -1352,52 +1315,95 @@ pub fn import(app: &AppHandle<Wry>, targets: &[SiteConfig]) -> Result<ImportRepo
     //    数量进报告由前端可见呈现，不静默。
     let ls_targets: Vec<&SiteConfig> =
         targets.iter().filter(|t| t.import_local_storage).collect();
-    let (ls_entries, ls_read) = if ls_targets.is_empty() {
+    let (ls_entries, _) = if ls_targets.is_empty() {
         (HashMap::new(), 0)
     } else {
         ilog!("ls sites: {}", ls_targets.iter().map(|t| t.id.as_str()).collect::<Vec<_>>().join(", "));
         scan_local_storage(&base, &scan, browser.name, &ls_targets)?
     };
 
-    // 7. reload 已加载的站点页面，让登录态立即生效；尚未完成首载的页面由
-    //    Tabs 的 pending_reload / pending_ls 在首载完成时补注入+reload
-    //    （导航请求可能早于注入发出，不带新登录态）。localStorage 站点
-    //    先 eval setItem 再 reload，一次刷新同时生效 cookie 与 localStorage。
+    // 7. reload 已加载的站点页面让登录态立即生效（cookie-only 路径）；localStorage
+    //    站点注册注入任务（Tabs::ls_jobs）：已加载页面的任务由本线程（后台
+    //    spawn_blocking）内联执行并等待真实 ACK，未就绪页面（含未创建的
+    //    webview）挂起，页面加载完成时由后台 worker 注入。任务确认成功后
+    //    reload（一次刷新同时生效 cookie 与 localStorage）；失败保留待重试，
+    //    站点级结果进报告与 browser-import-ls-result 事件。
     let site_ids: Vec<String> = targets.iter().map(|t| t.id.clone()).collect();
-    let ls_scripts: HashMap<String, String> = ls_entries
-        .iter()
-        .filter(|(_, v)| !v.is_empty())
-        .map(|(id, v)| (id.clone(), build_ls_inject_js(v)))
-        .collect();
-    let rl = app.state::<Tabs>().reload_loaded(&site_ids, &ls_scripts);
-    ilog!(
-        "reload now: {:?} (未就绪站点转入 pending_reload/pending_ls)",
-        rl.reloaded
-    );
-    if !ls_scripts.is_empty() {
-        ilog!(
-            "ls inject: now={} pending={} (待站点首载完成)",
-            rl.ls_injected_now, rl.ls_pending
+    let mut ls_specs: HashMap<String, LsJobSpec> = HashMap::new();
+    for (id, entries) in &ls_entries {
+        if entries.is_empty() {
+            continue;
+        }
+        let Some(site) = targets.iter().find(|t| &t.id == id) else {
+            continue;
+        };
+        let Some(origin) = origin_of(&site.url) else {
+            continue;
+        };
+        let nonce = LS_NONCE.fetch_add(1, Ordering::Relaxed) + 1;
+        ls_specs.insert(
+            id.clone(),
+            LsJobSpec {
+                script: build_ls_inject_js(entries, &origin, nonce),
+                expected_origin: origin,
+                nonce,
+                entries: entries.len(),
+            },
         );
-        // FAMA_DEBUG_IMPORT：延迟回读验证（只回读键存在计数，不回读 value）
-        if debug_import() {
-            let ls_keys: Vec<(String, Vec<String>)> = ls_entries
-                .iter()
-                .filter(|(_, v)| !v.is_empty())
-                .map(|(id, v)| (id.clone(), v.iter().map(|e| e.key.clone()).collect()))
-                .collect();
-            spawn_ls_verify(app.clone(), ls_keys);
+    }
+    let tabs = app.state::<Tabs>();
+    let rl = tabs.reload_loaded(&site_ids, &ls_specs);
+    let mut reloaded = rl.reloaded;
+    let mut ls_reports = rl.ls_pending;
+    for (site_id, snap) in &rl.ls_immediate {
+        let result = tabs.run_ls_attempt(app, site_id, snap);
+        let fin = tabs.finalize_ls_attempt(site_id, snap.generation, &result);
+        // 只在 generation 未被替换时计入（旧任务迟到结果不进报告）
+        if fin != LsFinalize::Stale {
+            if fin == LsFinalize::Confirmed {
+                if let Some(wv) = tabs.get(site_id) {
+                    if wv.eval("location.reload()").is_ok() {
+                        reloaded.push(site_id.clone());
+                    }
+                }
+            }
+            let report = ls_report_from_result(site_id, snap, &result);
+            ilog!(
+                "ls inject: {} gen={} status={} written={} failed={} pending=0",
+                report.site_id,
+                report.generation,
+                report.status,
+                report.injected,
+                report.failed
+            );
+            ls_reports.push(report);
+        } else {
+            ls_reports.push(LsSiteReport::pending(
+                site_id,
+                snap.generation,
+                snap.spec.entries,
+            ));
         }
     }
-
     ilog!(
-        "done: browser={} profiles={:?} injected={} ls_read={} ls_injected={} ls_pending={}",
+        "reload now: {:?} (cookie-only)；ls 站点注入结果：{:?}",
+        reloaded,
+        ls_reports
+            .iter()
+            .map(|r| format!("{}={}", r.site_id, r.status))
+            .collect::<Vec<_>>()
+    );
+
+    let totals = ls_totals(&ls_reports);
+    ilog!(
+        "done: browser={} profiles={:?} injected={} ls_read={} ls_injected={} ls_pending={} ls_failed={}",
         browser.name,
         outcome.profiles_scanned,
         injected,
-        ls_read,
-        rl.ls_injected_now,
-        rl.ls_pending
+        totals.read,
+        totals.injected,
+        totals.pending,
+        totals.failed
     );
     Ok(ImportReport {
         browser: browser.name.to_string(),
@@ -1411,10 +1417,12 @@ pub fn import(app: &AppHandle<Wry>, targets: &[SiteConfig]) -> Result<ImportRepo
         injected,
         skipped_decrypt: outcome.skips.decrypt,
         skipped_other,
-        reloaded: rl.reloaded,
-        ls_read,
-        ls_injected: rl.ls_injected_now,
-        ls_pending: rl.ls_pending,
+        reloaded,
+        ls_read: totals.read,
+        ls_injected: totals.injected,
+        ls_pending: totals.pending,
+        ls_failed: totals.failed,
+        ls_sites: ls_reports,
     })
 }
 
@@ -1864,11 +1872,12 @@ mod tests {
         );
     }
 
-    /// 注入脚本：首行条目计数头（tabs::ls_scripts_entry_count 的依据）+
-    /// 键值 JSON 转义（引号/换行/`</script>` 等任意字符安全内嵌，可原样
-    /// 解析回原值）
+    /// 注入脚本形状：origin 自检（不匹配不触碰 localStorage）、nonce 内嵌、
+    /// ACK 前缀、逐条 setItem + getItem 回读比对、无空 catch（失败计入 f）。
+    /// 键值经 JSON 转义内嵌（引号/换行/`</script>` 等任意字符安全，可原样
+    /// 解析回原值）。红线：脚本除键值数据外不含任何敏感内容之外的回传字段。
     #[test]
-    fn build_ls_inject_js_escapes_and_counts() {
+    fn build_ls_inject_js_shape_and_escapes() {
         let entries = vec![
             LsEntry {
                 key: "access_token".into(),
@@ -1879,12 +1888,22 @@ mod tests {
                 value: "plain".into(),
             },
         ];
-        let js = build_ls_inject_js(&entries);
-        assert!(js.starts_with("// entries: 2\n"));
-        assert!(js.contains("localStorage.setItem"));
-        // 从 `var d=` 之后流式解析第一个 JSON 值（不能找 `]`——脚本里
-        // `d[i][1]` 也含方括号）
-        let marker = "var d=";
+        let js = build_ls_inject_js(&entries, "https://www.kimi.com", 42);
+        // origin 门禁：脚本先比对 location.origin，不匹配直接 return（不碰 localStorage）
+        assert!(js.contains(r#"var expected="https://www.kimi.com""#));
+        assert!(js.contains("if(location.origin!==expected){return;}"));
+        // nonce 内嵌 + ACK 前缀（Rust 侧轮询 fama-ls-ack=<nonce>:）
+        assert!(js.contains("nonce=42"));
+        assert!(js.contains("'#fama-ls-ack='+nonce+':'"));
+        // 逐条写入 + 回读比对，失败可数（无空 catch）
+        assert!(js.contains("localStorage.setItem(data[i][0],data[i][1])"));
+        assert!(js.contains("localStorage.getItem(data[i][0])===data[i][1]"));
+        assert!(!js.contains("catch(e){}"));
+        // ACK 载荷只含计数与固定类别，不含键值
+        assert!(js.contains("attempted:data.length"));
+        // 键值 JSON 转义：从 data= 之后流式解析第一个 JSON 值（不能找 `]`——
+        // 后续脚本里 `data[i][1]` 也含方括号）
+        let marker = "data=";
         let rest = &js[js.find(marker).unwrap() + marker.len()..];
         let parsed: Vec<(String, String)> =
             serde_json::Deserializer::from_str(rest)
@@ -1983,15 +2002,6 @@ mod tests {
         assert!(got
             .iter()
             .all(|e| !e.value.contains("other-site") && !e.value.contains("evil")));
-    }
-
-    /// 验证探针：只内嵌键名（无 value）、写 fama-ls-verify fragment
-    #[test]
-    fn ls_verify_probe_js_shape() {
-        let js = ls_verify_probe_js(&["access_token".to_string(), "msh_user_id".to_string()]);
-        assert!(js.contains(r#"["access_token","msh_user_id"]"#));
-        assert!(js.contains("#fama-ls-verify='+p+'/'+t"));
-        assert!(js.contains("localStorage.getItem"));
     }
 
     /// 浏览器从未用过 localStorage（目录缺失）不算错误：空结果、零条目

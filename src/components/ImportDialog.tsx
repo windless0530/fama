@@ -1,5 +1,16 @@
-import { useState } from "react";
-import { SiteInfo, importBrowserSession } from "../lib/ipc";
+import { useEffect, useState } from "react";
+import {
+  ImportReport,
+  LsSiteReport,
+  SiteInfo,
+  importBrowserSession,
+} from "../lib/ipc";
+import {
+  analyzeImportReport,
+  describeLsSite,
+  lsSiteProblem,
+  mergeLsSites,
+} from "../lib/importReport";
 import { errText } from "../lib/importErrors";
 import { IS_MACOS } from "../lib/platform";
 
@@ -8,62 +19,68 @@ interface Props {
   onClose: () => void;
   /** 打开时即展示的错误（启动自动导入失败时由 App 传入；可原地重试） */
   initialError?: string;
+  /** 启动自动导入的报告：非空时直接进入结果视图（与手动导入同一分析） */
+  initialReport?: ImportReport;
+  /** pending localStorage 任务的后续结果事件（按 generation 合并展示） */
+  lsUpdates?: LsSiteReport[];
 }
 
-export default function ImportDialog({ sites, onClose, initialError }: Props) {
+export default function ImportDialog({
+  sites,
+  onClose,
+  initialError,
+  initialReport,
+  lsUpdates,
+}: Props) {
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState(initialError ?? "");
-  // 成功后的报告；非空时进入"结果"视图
-  const [summary, setSummary] = useState("");
+  // 已有导入报告时直接进入"结果"视图（自动导入的初始报告或手动导入结果）
+  const [report, setReport] = useState<ImportReport | null>(
+    initialReport ?? null,
+  );
+  // 后续事件按 generation 合并后的站点级实时状态
+  const [liveSites, setLiveSites] = useState<LsSiteReport[]>([]);
+
+  // App 侧状态变化时同步内部视图（新的自动导入结果 / 错误）
+  useEffect(() => {
+    setErr(initialError ?? "");
+  }, [initialError]);
+  useEffect(() => {
+    setReport(initialReport ?? null);
+  }, [initialReport]);
+  useEffect(() => {
+    setLiveSites((prev) => mergeLsSites(prev, lsUpdates ?? []));
+  }, [lsUpdates]);
+
+  const nameOf = (id: string) =>
+    sites.find((s) => s.id === id)?.name ?? id;
 
   const run = async () => {
     setBusy(true);
     setErr("");
     try {
       const r = await importBrowserSession(sites.map((s) => s.id));
-      // 实际扫描到的全部 profile（多 profile 扫描；回退兼容字段 profile）
-      const profiles =
-        r.profilesScanned.length > 0 ? r.profilesScanned.join("、") : r.profile;
-      // localStorage（kimi 等 SPA 站点）注入数含「立即注入」与「待页面就绪注入」
-      const lsN = r.lsInjected + r.lsPending;
-      // 读到但既没注入也没挂起（站点页面不可用等）→ 可见提示，不静默丢弃
-      const lsDropped = r.lsRead > lsN;
-      if (r.injected === 0 && lsN === 0) {
-        setSummary(
-          `未在 ${r.browser}（profile ${profiles}）找到这些站点的登录数据` +
-            (r.matched > 0
-              ? `：cookie 匹配到 ${r.matched} 条但均未导入成功。`
-              : "（cookie 与 localStorage 均为空）。请先在浏览器里登录对应站点。") +
-            (lsDropped
-              ? `另有 ${r.lsRead} 条 localStorage 数据未能注入（站点页面暂不可用，重试或切换一次标签页）。`
-              : ""),
-        );
-      } else {
-        const skipped =
-          r.skippedDecrypt + r.skippedOther > 0
-            ? `，跳过 ${r.skippedDecrypt + r.skippedOther} 条（无法解密或已过期）`
-            : "";
-        const parts = [`${r.injected} 条 cookie`];
-        if (lsN > 0)
-          parts.push(
-            `${lsN} 条 localStorage 登录数据${r.lsPending > 0 ? "（页面就绪后自动注入）" : ""}`,
-          );
-        setSummary(
-          `已从 ${r.browser}（profile ${profiles}）导入 ${parts.join("、")}${skipped}。` +
-            (r.reloaded.length > 0
-              ? `已刷新：${r.reloaded.join("、")}。`
-              : "站点页面将在下次加载时带上登录态。") +
-            (lsDropped
-              ? `另有 ${r.lsRead - lsN} 条 localStorage 数据未能注入（重试或切换一次标签页）。`
-              : ""),
-        );
-      }
+      setReport(r);
     } catch (e) {
       setErr(errText(e));
     } finally {
       setBusy(false);
     }
   };
+
+  // 统一分析：cookie 成功但 localStorage 站点失败/丢失时不再显示纯成功
+  const analysis = report ? analyzeImportReport(report, nameOf) : null;
+  // 结果视图里的站点级明细：报告快照 + 后续事件按 generation 合并
+  const lsLines = report
+    ? mergeLsSites(report.lsSites, liveSites)
+    : mergeLsSites([], liveSites);
+  const canRetry =
+    (analysis?.canRetry ?? false) || liveSites.some(lsSiteProblem);
+  const profiles = report
+    ? report.profilesScanned.length > 0
+      ? report.profilesScanned.join("、")
+      : report.profile
+    : null;
 
   return (
     <div className="dialog-overlay" onClick={busy ? undefined : onClose}>
@@ -76,13 +93,42 @@ export default function ImportDialog({ sites, onClose, initialError }: Props) {
             </button>
           )}
         </header>
-        {summary ? (
+        {analysis && report ? (
           <div className="dialog-body">
-            <p>{summary}</p>
-            <p className="hint-line">如登录态未生效，可切换一次标签页触发刷新</p>
-            <button className="primary" onClick={onClose}>
-              完成
-            </button>
+            <p>{analysis.dialogSummary}</p>
+            {profiles && (
+              <p className="hint-line">
+                来源：{report.browser}（profile {profiles}）
+                {report.reloaded.length > 0
+                  ? `；已刷新：${report.reloaded.map(nameOf).join("、")}`
+                  : ""}
+              </p>
+            )}
+            {lsLines.length > 0 && (
+              <ul className="ls-sites">
+                {lsLines.map((s) => (
+                  <li
+                    key={s.siteId}
+                    className={lsSiteProblem(s) ? "bad" : undefined}
+                  >
+                    {describeLsSite(s, nameOf)}
+                  </li>
+                ))}
+              </ul>
+            )}
+            <p className="hint-line">
+              如登录态未生效，可切换一次标签页触发刷新；待页面就绪的注入会自动完成并更新
+            </p>
+            <div className="actions">
+              {canRetry && (
+                <button disabled={busy} onClick={() => void run()}>
+                  {busy ? "导入中…" : "重试导入"}
+                </button>
+              )}
+              <button className="primary" disabled={busy} onClick={onClose}>
+                完成
+              </button>
+            </div>
           </div>
         ) : (
           <div className="dialog-body">

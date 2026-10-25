@@ -252,11 +252,13 @@ App 与系统浏览器默认互相隔离，新装机后各站点需要重新登�
 - 手写最小 LevelDB 只读解析（varint、block 前缀解压、footer→index→data blocks 遍历、WAL 32KB record 重组、WriteBatch、seq 大者胜 + 删除生效的合并语义、origin 前缀过滤）——不引入 rusty-leveldb：其依赖 integer-encoding 1.1.7 在 aarch64 有未对齐解引用崩溃，且不支持 zstd；
 - **直接读源文件不复制**：LevelDB 是追加型日志结构，只读解析容忍 torn write（最后几条不一致记录由解析器跳过，无损坏风险）；
 - **多 profile 扫描是硬要求**：实测 kimi token 在 Edge `Profile 1`（Default 只有旧域名空残留）；同键先扫到的 profile 胜（`last_used` 优先，与 cookie 去重一致）；
-- 注入：在对应站点 webview 的页面上下文 eval `localStorage.setItem(k, v)`（WKWebView localStorage 按 origin 隔离），随后 reload——一次刷新同时生效 cookie 与 localStorage；与 `pending_reload` 合并编排（`Tabs::reload_loaded(site_ids, ls_scripts)`）：已加载站点立即 eval+reload，未完成首载的挂 `pending_ls` 在首载 Finished 时 eval+reload（remove 语义消费，防循环；有 ls 的站点不再挂 `pending_reload`，避免二次 reload）；
-- ImportReport 增加 `lsRead` / `lsInjected` / `lsPending`，前端状态栏与 ImportDialog 均展示；读到但未能注入（站点页面不可用等）在 UI 可见提示，**不静默**；
-- **数据安全**：value 永不落日志（`FAMA_DEBUG_IMPORT=1` 也只打键名+长度）；注入脚本经 serde_json 转义任意字符；读不到（浏览器未登录过该站点）不算失败、计 0 可见。
+- 注入（`tabs.rs` 每站点 `LsJob` 任务 + `browser_session.rs` 生成的注入脚本）：在对应站点 webview 的页面上下文 eval `localStorage.setItem(k, v)`（WKWebView localStorage 按 origin 隔离），确认后 reload——一次刷新同时生效 cookie 与 localStorage；与 `pending_reload` 合并编排（`Tabs::reload_loaded(site_ids, ls_specs)`）：已加载站点在导入线程内联尝试（有界 ~3s），未完成首载或当前不在配置 origin 的挂任务，在页面回到配置 origin 的首载/导航 Finished 时由后台 worker 执行；任务确认成功即消费（同时消费该站 `pending_reload`，防二次 reload），失败保留可重试，reload 后的 Finished 不再命中任务（防注入/reload 循环）；
+- **三层 origin 门禁**（token 只可能写入精确匹配的站点 origin）：① native 侧 eval 前读当前完整 URL，origin（scheme + 标准化 host + 显式端口）与站点配置 origin 不完全一致则禁止 eval（任务保留等待）；② 注入脚本首行比较 `location.origin !== expected` 即返回，不触碰 localStorage（堵住 native 检查后的导航竞态）；③ ACK 只在页面仍位于预期 origin 时被接受。path/query/hash 不同不算差异；http/https、端口、裸域/www、相似域名、SSO 页一律拒绝；
+- **真实 ACK 计数**（eval 派发成功 ≠ 注入成功）：脚本逐条 `setItem` + `getItem` 回读比对，只有写入且回读一致才计入 `written`；单条失败计入 `failed`，外层脚本错误按固定类别回传——经 URL fragment `#fama-ls-ack=<nonce>:` + percent-encoded JSON 回执（nonce 每次注入唯一，防陈旧 ACK 误判）。Rust 侧校验 nonce / origin / generation / `attempted == 条目数` / `written + failed == attempted` 后才确认；`lsInjected` 只取合法 ACK 的 `written`；
+- ImportReport 增加 `lsRead` / `lsInjected` / `lsPending` / `lsFailed`（聚合 = 站点求和）与 `lsSites`（站点级明细：read / injected / pending / failed / status / 固定错误类别）；pending 任务后续完成/失败时经 `browser-import-ls-result` 事件推送同形站点结果，前端按站点 generation 合并，旧任务迟到事件不覆盖新结果；单站失败（`failed > 0` 或 `read > injected + pending`）在状态栏与 ImportDialog 均可见（自动导入与手动导入共用同一分析，cookie 成功不掩盖 localStorage 失败），**不静默**；
+- **数据安全**：value 及其任何片段永不落日志/报告（`FAMA_DEBUG_IMPORT=1` 也只打 host / 键名 / 长度 / 错误类别）；注入脚本经 serde_json 转义任意字符；ACK 只含计数与固定错误类别，不含键、值或异常原文；读不到（浏览器未登录过该站点）不算失败、计 0 可见。
 
-**kimi 登录态判定（不以 URL 判定）**：kimi 是 SPA，登录与否不改变 URL。判定信号：① 注入后在 webview eval 检查 `localStorage.getItem('access_token')` 非空；② 页面 DOM 登录态元素（用户头像 / 输入框可用）或注入器回传的 filled 状态。URL 只能证明页面加载，不能证明登录。
+**kimi 登录态判定（不以 URL 判定）**：kimi 是 SPA，登录与否不改变 URL。判定信号：① 注入脚本内每条 `setItem` 后 `getItem` 回读比对一致才计入确认（`lsInjected` 即真实落盘数，无需独立探针）；② 页面 DOM 登录态元素（用户头像 / 输入框可用）或注入器回传的 filled 状态。URL 只能证明页面加载，不能证明登录。
 
 ## 3. 数据库设计（store.rs）
 
@@ -319,6 +321,17 @@ interface Round       { id: number; question: string; createdAt: number; targets
 错误码（invoke reject 的 `code` 字段）：`E_SITES_CONFIG` / `E_TAB_CREATE` / `E_TAB_NOT_READY` / `E_INJECT_TIMEOUT` / `E_INJECT_SCRIPT` / `E_DB`；导入相关：`E_NO_SITES` / `E_DETECT_FAILED` / `E_UNSUPPORTED_BROWSER` / `E_KEYCHAIN_NOT_FOUND` / `E_KEYCHAIN_DENIED` / `E_BROWSER_DATA_MISSING` / `E_BROWSER_DATA_TCC_DENIED` / `E_COOKIE_DB_LOCKED` / `E_DECRYPT_FAILED` / `E_INJECT_FAILED` / `E_UNSUPPORTED_PLATFORM`。
 
 ```ts
+interface LsSiteReport {
+  siteId: string       // localStorage 站点 id
+  generation: number   // 任务 generation，越大越新（事件合并依据）
+  read: number         // LevelDB 读到的条目数
+  injected: number     // 合法 ACK 确认注入条数（eval 派发成功不计入）
+  pending: number      // 等待页面就绪的任务条数（未确认）
+  failed: number       // ACK 报告的写入失败条数
+  status: "ok" | "partial" | "failed" | "pending"
+  error?: string       // 固定错误类别文案；不含任何 key/value
+}
+
 interface ImportReport {
   browser: string          // 导入来源浏览器名
   profile: string          // 首个扫描的 profile 目录名（兼容字段）
@@ -328,10 +341,17 @@ interface ImportReport {
   skippedDecrypt: number   // 解密失败（非 v10 等）
   skippedOther: number     // 过期 / 非 UTF-8 等
   reloaded: string[]       // 注入后触发 reload 的站点 id
+  lsRead: number           // localStorage 读到条目数
+  lsInjected: number       // 合法 ACK 确认注入条数
+  lsPending: number        // 等待页面就绪条数
+  lsFailed: number         // 站点写入失败条数（lsSites 求和）
+  lsSites: LsSiteReport[]  // 站点级明细（聚合字段的来源）
 }
 ```
 
-诊断：后端全程打 `[import]` 结构化日志（stderr），skip 原因细分（expired / utf8 / decrypt / read / expires_unknown）；设 `FAMA_DEBUG_IMPORT=1` 时额外打印每条被跳过 cookie 的 host / name / expires_utc 原始值与换算值、解密错误类别、明文前 8 字节 hex（永不打印完整 value），以及每个 Cookies 库的 schema 原文与最新 last_access（区分 schema 变化 vs 旧库）。
+事件：`browser-import-ls-result`（payload = `LsSiteReport`）——pending localStorage 任务后续完成/失败时由后台 worker 推送；前端按站点 generation 合并，旧任务的迟到事件不覆盖新结果。
+
+诊断：后端全程打 `[import]` 结构化日志（stderr），skip 原因细分（expired / utf8 / decrypt / read / expires_unknown）；设 `FAMA_DEBUG_IMPORT=1` 时额外打印每条被跳过 cookie 的 host / name / expires_utc 原始值与换算值、解密错误类别，以及每个 Cookies 库的 schema 原文与最新 last_access（区分 schema 变化 vs 旧库）。**红线：cookie / localStorage 的 value 及其任何片段（包括明文前缀）永不打印。**
 
 ## 5. 前端设计（src/）
 

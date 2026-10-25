@@ -46,6 +46,24 @@ export interface Round {
   targets: RoundTarget[];
 }
 
+/** localStorage 注入的站点级结果（tabs.rs LsSiteReport 的契约） */
+export interface LsSiteReport {
+  siteId: string;
+  /** 任务 generation；越大越新，事件合并时旧 generation 不得覆盖新结果 */
+  generation: number;
+  /** 从浏览器 LevelDB 读到的条目数 */
+  read: number;
+  /** 来自合法 ACK 的确认注入条数 */
+  injected: number;
+  /** 仍在等待页面就绪的任务条数（未确认，不得显示为成功） */
+  pending: number;
+  /** ACK 报告的写入失败条数 */
+  failed: number;
+  status: "ok" | "partial" | "failed" | "pending";
+  /** 固定错误类别文案；不含任何 key/value */
+  error?: string;
+}
+
 // 浏览器登录态导入报告（commands.rs import_browser_session 的契约）
 export interface ImportReport {
   browser: string;
@@ -60,11 +78,18 @@ export interface ImportReport {
   reloaded: string[];
   /** localStorage 扫描读到的条目数（kimi 等不走 cookie 认证的站点） */
   lsRead: number;
-  /** 已加载页面上立即注入的 localStorage 条数 */
+  /** 来自合法 ACK 的确认注入条数（eval 派发成功不计入） */
   lsInjected: number;
-  /** 挂起待站点首次加载完成注入的 localStorage 条数 */
+  /** 挂起待站点回到配置 origin 后注入的 localStorage 条数 */
   lsPending: number;
+  /** 站点级写入失败条数（lsSites 求和；cookie 成功不能抵消） */
+  lsFailed: number;
+  /** localStorage 注入的站点级明细 */
+  lsSites: LsSiteReport[];
 }
+
+/** pending localStorage 任务完成时由后台 worker 发出的 Tauri 事件 */
+export const LS_RESULT_EVENT = "browser-import-ls-result";
 
 export async function listSites(): Promise<SiteInfo[]> {
   return invoke("list_sites");

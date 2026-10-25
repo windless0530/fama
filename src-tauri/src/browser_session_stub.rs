@@ -21,10 +21,12 @@ pub struct ImportReport {
     pub skipped_decrypt: usize,
     pub skipped_other: usize,
     pub reloaded: Vec<String>,
-    // 以下三个 localStorage 字段与 macOS 实现同步（本 stub 永远返回 0）
+    // 以下 localStorage 字段与 macOS 实现同步（本 stub 永远返回 0/空）
     pub ls_read: usize,
     pub ls_injected: usize,
     pub ls_pending: usize,
+    pub ls_failed: usize,
+    pub ls_sites: Vec<crate::tabs::LsSiteReport>,
 }
 
 /// 带 "E_XXX" 错误码的导入失败（与 macOS 实现同形，commands 层统一拼接）

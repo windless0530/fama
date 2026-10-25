@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import TabBar from "./components/TabBar";
 import ContentArea from "./components/ContentArea";
 import InputBar from "./components/InputBar";
@@ -6,6 +6,9 @@ import HistorySheet from "./components/HistorySheet";
 import ImportDialog from "./components/ImportDialog";
 import {
   DispatchResult,
+  ImportReport,
+  LS_RESULT_EVENT,
+  LsSiteReport,
   SiteInfo,
   TargetStatus,
   dispatchQuestion,
@@ -13,6 +16,12 @@ import {
   listSites,
   preloadTabs,
 } from "./lib/ipc";
+import {
+  analyzeImportReport,
+  describeLsSite,
+  lsSiteProblem,
+  mergeLsSites,
+} from "./lib/importReport";
 import { errCode, errText } from "./lib/importErrors";
 import { IS_MACOS } from "./lib/platform";
 
@@ -36,31 +45,32 @@ export default function App() {
   const [importOpen, setImportOpen] = useState(false);
   // 启动自动导入失败时打开 ImportDialog 并展示的错误
   const [importError, setImportError] = useState<string | null>(null);
+  // 启动自动导入的报告：打开 ImportDialog 时直接作为结果视图（与手动
+  // 导入共用同一分析，cookie 成功不再掩盖 localStorage 失败）
+  const [autoReport, setAutoReport] = useState<ImportReport | null>(null);
+  // pending localStorage 任务完成的后续事件（按 generation 合并；旧任务
+  // 迟到事件不覆盖新结果），实时同步给打开中的 ImportDialog
+  const [lsEvents, setLsEvents] = useState<LsSiteReport[]>([]);
+  // 事件回调里查站点名（注册时 sites 尚未加载）
+  const sitesRef = useRef<SiteInfo[]>([]);
+  const nameOf = useCallback(
+    (id: string) => sitesRef.current.find((x) => x.id === id)?.name ?? id,
+    [],
+  );
 
   // 启动自动复用默认浏览器登录态（macOS；每进程一次，后端守卫）。
-  // 成功：状态栏提示；零注入 / 失败：打开 ImportDialog 展示原因，可原地重试
-  // （不静默失败）。E_AUTO_ALREADY_RUN = 本进程已导入过（dev 热重载等），静默。
+  // 分析统一走 analyzeImportReport：存在 localStorage 站点失败/丢失时
+  // 即便 cookie 全部成功也打开 ImportDialog 展示站点级结果（不静默）。
+  // E_AUTO_ALREADY_RUN = 本进程已导入过（dev 热重载等），静默。
   const autoImport = async (ids: string[]) => {
     try {
       const r = await importBrowserSessionAuto(ids);
-      // localStorage（kimi 等）注入数含「立即注入」与「待页面就绪注入」两种
-      const lsN = r.lsInjected + r.lsPending;
-      if (r.injected > 0 || lsN > 0) {
-        const parts = [`${r.injected} 条 cookie`];
-        if (lsN > 0) parts.push(`${lsN} 条 localStorage 登录数据`);
-        setStatusErr(false);
-        setStatusLine(`已复用 ${r.browser} 的登录状态（${parts.join("、")}）`);
-      } else if (r.matched > 0) {
-        setImportError(
-          `浏览器 cookie 匹配到 ${r.matched} 条但均未导入成功（可能启用了新的加密方案），可重试`,
-        );
-        setImportOpen(true);
-      } else {
-        setImportError(
-          "未在默认浏览器中找到这些站点的登录状态（cookie 与 localStorage 均为空）；可先在浏览器里登录对应站点，再点「开始导入」重试",
-        );
-        setImportOpen(true);
-      }
+      setAutoReport(r);
+      setImportError(null);
+      const a = analyzeImportReport(r, nameOf);
+      setStatusErr(a.statusIsError);
+      setStatusLine(a.statusLine);
+      if (a.openDialog) setImportOpen(true);
     } catch (e) {
       if (errCode(e) === "E_AUTO_ALREADY_RUN") return;
       setImportError(errText(e));
@@ -69,9 +79,43 @@ export default function App() {
   };
 
   useEffect(() => {
+    let unlisten: (() => void) | undefined;
+    let cancelled = false;
     void (async () => {
+      // 先注册 pending localStorage 结果事件、再触发自动导入，
+      // 导入后到位的任务完成事件才不会丢失（StrictMode 双挂载安全）
+      if (IS_MACOS) {
+        try {
+          const { listen } = await import("@tauri-apps/api/event");
+          const un = await listen<LsSiteReport>(
+            LS_RESULT_EVENT,
+            (ev) => {
+              const s = ev.payload;
+              setLsEvents((prev) => mergeLsSites(prev, [s]));
+              if (lsSiteProblem(s)) {
+                setStatusErr(true);
+                setStatusLine(
+                  `部分登录数据未生效：${describeLsSite(s, nameOf)}，详见导入面板`,
+                );
+                setImportOpen(true);
+              } else if (s.injected > 0) {
+                setStatusErr(false);
+                setStatusLine(describeLsSite(s, nameOf));
+              }
+            },
+          );
+          if (cancelled) {
+            un();
+            return;
+          }
+          unlisten = un;
+        } catch (e) {
+          console.error("注册 localStorage 结果事件失败", e);
+        }
+      }
       try {
         const s = await listSites();
+        sitesRef.current = s;
         setSites(s);
         if (s.length > 0) {
           setActiveTab(s[0].id);
@@ -90,6 +134,10 @@ export default function App() {
         setStatusLine(`站点配置加载失败：${e}`);
       }
     })();
+    return () => {
+      cancelled = true;
+      unlisten?.();
+    };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -183,6 +231,8 @@ export default function App() {
         <ImportDialog
           sites={sites}
           initialError={importError ?? undefined}
+          initialReport={autoReport ?? undefined}
+          lsUpdates={lsEvents}
           onClose={() => {
             setImportOpen(false);
             setImportError(null);
