@@ -53,8 +53,14 @@ cbc = { version = "0.1", features = ["alloc", "block-padding"] }
 pbkdf2 = { version = "0.12", default-features = false, features = ["hmac"] }
 hmac = "0.12"
 sha1 = "0.10"
+# Edge 156+ 的 v10 明文带 SHA-256(host_key) 前缀（app-bound 等价方案），校验/剥离用
+sha2 = "0.10"
 # Safe Storage 原始 secret 读出后立即 zeroize，只留内存派生 key
 zeroize = "1"
+# localStorage LevelDB block 解压：snappy（snap）与 zstd（ruzstd，纯 Rust 解码
+# 器，避免 C 绑定依赖；Edge 156 实测 localStorage SSTable 用 zstd 压缩）
+snap = "1"
+ruzstd = "0.9"
 
 [profile.release]
 codegen-units = 1

@@ -12,6 +12,10 @@ mod browser_session;
 #[path = "browser_session_stub.rs"]
 mod browser_session;
 
+// Chromium localStorage LevelDB 只读解析器（仅 macOS 导入路径使用）
+#[cfg(target_os = "macos")]
+mod local_storage_db;
+
 use tauri::Manager;
 
 /// 全局站点注册表（setup 时加载一次）
@@ -62,6 +66,7 @@ pub fn run() {
             commands::list_rounds,
             commands::rate,
             commands::import_browser_session,
+            commands::import_browser_session_auto,
         ])
         .run(tauri::generate_context!())
         .expect("error while running fama");

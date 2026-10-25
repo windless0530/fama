@@ -19,7 +19,7 @@
 ### 2.1 多 Tab 内嵌 AI 网页
 
 - 首批站点：ChatGPT（chatgpt.com）、GLM（chatglm.cn）、DeepSeek（chat.deepseek.com）、Kimi（kimi.com）；
-- App 使用自己的 cookie 容器，与系统浏览器天然隔离；macOS 支持用户主动从默认 Chromium 系浏览器（Chrome / Edge / Brave / Vivaldi / Opera / Chromium）导入登录 cookie，免去重复登录（需通过确认框与系统钥匙串授权两道确认；不读取浏览器密码库，不支持 Safari / Firefox 导入；详见 design.md §2.5.1）。**硬前提**：浏览器数据目录受 macOS 隐私保护（TCC），须先在「系统设置 → 隐私与安全性 → 完全磁盘访问」给运行环境授权——开发模式给运行它的终端 App（如 iTerm2 / Terminal），安装版给 fama.app，授权后完全退出并重启该 App，否则导入会被系统拦截（报 `E_BROWSER_DATA_TCC_DENIED`）；
+- App 使用自己的 cookie 容器，与系统浏览器天然隔离；macOS 支持从默认 Chromium 系浏览器（Chrome / Edge / Brave / Vivaldi / Opera / Chromium）复用登录 cookie，免去重复登录：**启动时自动导入**（每进程一次，首次会弹系统钥匙串授权框，选「始终允许」后续启动无感；失败或零导入会弹窗说明原因、可原地重试，不静默失败），也可随时从 TabBar 🔑 手动导入（确认框 + 钥匙串两道确认；不读取浏览器密码库，不支持 Safari / Firefox 导入；详见 design.md §2.5.1）。对 Kimi 这类不走 cookie 认证的 SPA 站点（登录令牌存 localStorage），同一导入流程会额外扫描浏览器 localStorage 并注入对应站点页面（多 profile 扫描、注入后自动刷新；详见 design.md §2.5.2）。**硬前提**：浏览器数据目录受 macOS 隐私保护（TCC），须先在「系统设置 → 隐私与安全性 → 完全磁盘访问」给运行环境授权——开发模式给运行它的终端 App（如 iTerm2 / Terminal），安装版给 fama.app，授权后完全退出并重启该 App，否则导入会被系统拦截（报 `E_BROWSER_DATA_TCC_DENIED`）；
 - 登录/登出/会话历史直接使用各家网页自带能力，App 不接管、不保存浏览器密码或站点账号密码；导入的 cookie 进入本 app 自己的 webview 数据容器，仅本 app 可见、与系统浏览器相互独立，带有效期的 cookie 可能被持久化到本机（与在 app 里正常登录产生的 cookie 行为一致）；
 - 桌面端可选「分栏/网格」布局，多站点回答并排对照；移动端为单 Tab + 底部切换。
 

@@ -14,6 +14,10 @@ struct RawSite {
     url: String,
     icon: String,
     injector: String,
+    /// 该站点登录态依赖 localStorage（如 kimi 的 token 不在 cookie），
+    /// 导入流程除 cookie 外还要读浏览器 localStorage 并注入 webview
+    #[serde(default)]
+    import_local_storage: bool,
 }
 
 /// 前端可见的站点信息（IPC 契约）
@@ -36,6 +40,8 @@ pub struct SiteConfig {
     pub injector_src: &'static str,
     /// 脚本头 `// @version N`，落库用于排查
     pub injector_ver: String,
+    /// 站点登录态依赖 localStorage（sites.toml `import_local_storage`）
+    pub import_local_storage: bool,
 }
 
 /// 注入脚本注册：新增站点在这里加一行 include_str!
@@ -90,6 +96,7 @@ pub fn load() -> Result<Vec<SiteConfig>, String> {
             icon: r.icon,
             injector_src: src,
             injector_ver: injector_version(src),
+            import_local_storage: r.import_local_storage,
         });
     }
     Ok(out)
@@ -104,6 +111,19 @@ mod tests {
         let sites = load().unwrap();
         assert_eq!(sites.len(), 4);
         assert!(sites.iter().any(|s| s.id == "chatgpt"));
+    }
+
+    /// localStorage 导入是按站点配置的通用能力：当前只有 kimi 打开
+    #[test]
+    fn local_storage_import_is_per_site() {
+        let sites = load().unwrap();
+        let kimi = sites.iter().find(|s| s.id == "kimi").unwrap();
+        assert!(kimi.import_local_storage);
+        for s in &sites {
+            if s.id != "kimi" {
+                assert!(!s.import_local_storage, "{} 不应开 localStorage 导入", s.id);
+            }
+        }
     }
 
     #[test]

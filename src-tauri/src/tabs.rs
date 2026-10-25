@@ -50,6 +50,16 @@ pub struct Tabs {
     /// 从隐藏恢复显示时 WKWebView 的远端图层可能停留在旧几何（隐藏期间的
     /// frame 变化不进图层），需要跨 CA 事务的分步重设，见 apply_layout。
     shown: Mutex<HashSet<String>>,
+    /// cookie 导入注入时仍未完成首次加载的站点：其导航请求早于注入发出、
+    /// 不带新 cookie，首次加载完成（on_page_load Finished）时补一次 reload。
+    /// consume 与 insert 都以 pending_reload 锁串行化，reload 只触发一次。
+    pending_reload: Mutex<HashSet<String>>,
+    /// localStorage 导入（kimi 等不走 cookie 认证的站点）：site_id → 注入
+    /// 脚本（localStorage.setItem 批量）。注入必须在对应 origin 的页面
+    /// 上下文执行——未完成首载的站点挂起，首载 Finished 时 eval + reload
+    /// （remove 语义消费，防循环）；该 reload 同时让已注入的 cookie 生效，
+    /// 与 pending_reload 互斥（见 reload_loaded）。
+    pending_ls: Mutex<HashMap<String, String>>,
     /// 创建互斥：preload / layout_update / dispatch 可能并发 ensure_tab，
     /// 注册表插入在创建之后，需要串行化 + 双重检查防止重复创建。
     creating: Mutex<()>,
@@ -62,6 +72,8 @@ impl Tabs {
             rects: Mutex::new(HashMap::new()),
             loaded: Mutex::new(HashSet::new()),
             shown: Mutex::new(HashSet::new()),
+            pending_reload: Mutex::new(HashSet::new()),
+            pending_ls: Mutex::new(HashMap::new()),
             creating: Mutex::new(()),
         }
     }
@@ -78,19 +90,81 @@ impl Tabs {
         self.loaded.lock().unwrap().contains(site_id)
     }
 
-    /// reload 已完成首次加载的站点 webview（浏览器 cookie 导入后刷新登录态用）。
-    /// 未加载的站点首次导航自然带上新 cookie，无需处理。返回实际触发 reload 的站点。
-    pub fn reload_loaded(&self, site_ids: &[String]) -> Vec<String> {
-        let mut reloaded = Vec::new();
+    /// reload 已完成首次加载的站点 webview（浏览器登录态导入后刷新用）。
+    /// - 已加载的站点：有 localStorage 注入脚本的先 eval `localStorage.setItem`
+    ///   再 reload（一次 reload 同时让 cookie 与 localStorage 生效）；否则仅 reload；
+    /// - 尚未完成首载的站点：有注入脚本的转入 pending_ls（首载 Finished 时
+    ///   eval + reload），否则转入 pending_reload（首载 Finished 时补 reload）；
+    /// - 尚未创建的站点无需处理（创建时数据已在，首导航即带上）。
+    ///
+    /// `ls_scripts` 为空时行为与纯 cookie 导入完全一致。
+    pub fn reload_loaded(&self, site_ids: &[String], ls_scripts: &HashMap<String, String>) -> ImportReload {
+        let mut out = ImportReload::default();
+        // 锁序：loaded → webviews → pending_reload → pending_ls（consume_* 只单独
+        // 取各自锁，无反向嵌套，无死锁）
         let loaded = self.loaded.lock().unwrap();
-        for (id, wv) in self.webviews.lock().unwrap().iter() {
-            if site_ids.contains(id) && loaded.contains(id) && wv.eval("location.reload()").is_ok()
-            {
-                reloaded.push(id.clone());
+        let webviews = self.webviews.lock().unwrap();
+        let mut pending = self.pending_reload.lock().unwrap();
+        let mut pending_ls = self.pending_ls.lock().unwrap();
+        for (id, wv) in webviews.iter() {
+            if !site_ids.contains(id) {
+                continue;
+            }
+            let script = ls_scripts.get(id);
+            if loaded.contains(id) {
+                let mut ok = true;
+                if let Some(js) = script {
+                    // WKWebView 的 localStorage 按导航 origin 隔离；此时页面已
+                    // 在站点 origin 上，eval 直接写入该 origin 的 localStorage
+                    ok = wv.eval(js).is_ok();
+                    if ok {
+                        out.ls_injected_now += ls_scripts_entry_count(js);
+                    }
+                }
+                if ok && wv.eval("location.reload()").is_ok() {
+                    out.reloaded.push(id.clone());
+                }
+            } else if let Some(js) = script {
+                out.ls_pending += ls_scripts_entry_count(js);
+                pending_ls.insert(id.clone(), js.clone());
+            } else {
+                pending.insert(id.clone());
             }
         }
-        reloaded
+        out
     }
+
+    /// 首次加载完成时消费 pending_reload 标记：存在则返回 true（调用方应 reload）。
+    /// remove 语义保证同一站点一次导入只补一次 reload，不会循环。
+    fn consume_pending_reload(&self, site_id: &str) -> bool {
+        self.pending_reload.lock().unwrap().remove(site_id)
+    }
+
+    /// 首次加载完成时消费 pending_ls：存在则返回注入脚本（调用方 eval 后 reload）。
+    fn consume_pending_ls(&self, site_id: &str) -> Option<String> {
+        self.pending_ls.lock().unwrap().remove(site_id)
+    }
+}
+
+/// reload_loaded 的结果（browser_session 拼进 ImportReport）
+#[derive(Debug, Default)]
+pub struct ImportReload {
+    /// 实际立即触发 reload 的站点
+    pub reloaded: Vec<String>,
+    /// 已加载站点上立即 eval 注入的 localStorage 条数
+    pub ls_injected_now: usize,
+    /// 挂起待首载完成注入的 localStorage 条数
+    pub ls_pending: usize,
+}
+
+/// 从注入脚本里数出条目数（脚本由 browser_session::build_ls_inject_js 生成，
+/// 首行注释带 `// entries: N`——避免 eval 结果无法同步回读的计数手段）
+fn ls_scripts_entry_count(js: &str) -> usize {
+    js.lines()
+        .next()
+        .and_then(|l| l.trim().strip_prefix("// entries: "))
+        .and_then(|n| n.trim().parse().ok())
+        .unwrap_or(0)
 }
 
 /// 幂等创建站点 webview。创建动作派发到主线程执行，句柄回传存入注册表。
@@ -141,7 +215,22 @@ pub fn ensure_tab(app: &AppHandle<Wry>, tabs: &Tabs, site: &SiteConfig) -> Resul
                 .on_page_load(|wv, payload| {
                     eprintln!("[tabs] {} page {:?} {}", wv.label(), payload.event(), payload.url());
                     if matches!(payload.event(), PageLoadEvent::Finished) {
-                        wv.state::<Tabs>().mark_loaded(wv.label());
+                        let tabs = wv.state::<Tabs>();
+                        tabs.mark_loaded(wv.label());
+                        // 导入后才完成首载的页面：导航请求早于注入发出。
+                        // localStorage 注入优先（eval 写入后 reload，一次刷新同时
+                        // 生效 cookie 与 localStorage，并把同站点的 pending_reload
+                        // 一并消费掉防二次 reload）；否则按 cookie 路径补 reload。
+                        // consume 的 remove 语义防循环。
+                        if let Some(js) = tabs.consume_pending_ls(wv.label()) {
+                            eprintln!("[tabs] {} post-import localStorage inject + reload", wv.label());
+                            let _ = wv.eval(&js);
+                            let _ = wv.eval("location.reload()");
+                            let _ = tabs.consume_pending_reload(wv.label());
+                        } else if tabs.consume_pending_reload(wv.label()) {
+                            eprintln!("[tabs] {} post-import reload", wv.label());
+                            let _ = wv.eval("location.reload()");
+                        }
                     }
                 }),
                 LogicalPosition::new(0.0, 44.0),
@@ -395,20 +484,80 @@ pub async fn eval_with_ack(
 
 /// 读取站点 webview 当前 URL 的 fragment（读取派发到主线程，同步等待）
 fn read_fragment(app: &AppHandle<Wry>, tabs: &Tabs, site_id: &str) -> Option<String> {
-    let wv = tabs.get(site_id)?;
-    // WKWebView 首次提交导航前 URL 为 nil，wry 的 url() 会 unwrap panic
-    if !tabs.is_loaded(site_id) {
-        return None;
+    tabs.url_fragment(app, site_id)
+}
+
+impl Tabs {
+    /// eval 诊断探针到已完成首载的站点页面（browser_session 的 FAMA_DEBUG_IMPORT
+    /// 回读验证用）；页面未就绪 / eval 失败返回 false
+    pub fn eval_probe_if_loaded(&self, site_id: &str, js: &str) -> bool {
+        match self.get(site_id) {
+            Some(wv) if self.is_loaded(site_id) => wv.eval(js).is_ok(),
+            _ => false,
+        }
     }
-    let (tx, rx) = mpsc::channel();
-    app.run_on_main_thread(move || {
-        // 站点页 URL 形如 https://host/path#fama-ack=...；SPA 改 hash 不触发导航
-        let _ = tx.send(
-            wv.url()
-                .ok()
-                .and_then(|u| u.fragment().map(|s| s.to_string())),
-        );
-    })
-    .ok()?;
-    rx.recv_timeout(Duration::from_millis(500)).ok().flatten()
+
+    /// 读取站点 webview 当前 URL 的 fragment（eval_with_ack 之外的诊断/验证
+    /// 路径共用：eval 探针把结果写进 hash——SPA 改 hash 不触发导航）
+    pub fn url_fragment(&self, app: &AppHandle<Wry>, site_id: &str) -> Option<String> {
+        let wv = self.get(site_id)?;
+        // WKWebView 首次提交导航前 URL 为 nil，wry 的 url() 会 unwrap panic
+        if !self.is_loaded(site_id) {
+            return None;
+        }
+        let (tx, rx) = mpsc::channel();
+        app.run_on_main_thread(move || {
+            // 站点页 URL 形如 https://host/path#fama-ack=...；SPA 改 hash 不触发导航
+            let _ = tx.send(
+                wv.url()
+                    .ok()
+                    .and_then(|u| u.fragment().map(|s| s.to_string())),
+            );
+        })
+        .ok()?;
+        rx.recv_timeout(Duration::from_millis(500)).ok().flatten()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// pending_reload 的消费语义：标记后首载完成消费一次（触发补 reload），
+    /// 之后再次加载完成不得再消费（reload 自身也会触发 Finished，防循环）。
+    /// reload_loaded 对未就绪站点的标记路径需要真实 webview 句柄，无法单测，
+    /// 这里直接对标记集合操作验证 consume 端语义。
+    #[test]
+    fn pending_reload_consumed_once() {
+        let tabs = Tabs::new();
+        tabs.pending_reload
+            .lock()
+            .unwrap()
+            .insert("kimi".to_string());
+        assert!(tabs.consume_pending_reload("kimi")); // 首次：补 reload
+        assert!(!tabs.consume_pending_reload("kimi")); // reload 后的 Finished：不再补
+        assert!(!tabs.consume_pending_reload("chatgpt")); // 未标记的站点
+    }
+
+    /// pending_ls 同语义：消费一次返回脚本，之后为 None（防注入-reload 循环）
+    #[test]
+    fn pending_ls_consumed_once() {
+        let tabs = Tabs::new();
+        tabs.pending_ls
+            .lock()
+            .unwrap()
+            .insert("kimi".to_string(), "js-here".to_string());
+        assert_eq!(tabs.consume_pending_ls("kimi"), Some("js-here".to_string()));
+        assert_eq!(tabs.consume_pending_ls("kimi"), None);
+        assert_eq!(tabs.consume_pending_ls("chatgpt"), None);
+    }
+
+    /// 注入脚本条目计数：认 build_ls_inject_js 首行的 `// entries: N` 注释
+    #[test]
+    fn ls_scripts_entry_count_parses_header() {
+        assert_eq!(ls_scripts_entry_count("// entries: 42\n(function(){})()"), 42);
+        assert_eq!(ls_scripts_entry_count("// entries: 0\n(function(){})()"), 0);
+        assert_eq!(ls_scripts_entry_count("(function(){})()"), 0); // 无头
+        assert_eq!(ls_scripts_entry_count("// entries: abc\n()"), 0); // 非数字
+    }
 }

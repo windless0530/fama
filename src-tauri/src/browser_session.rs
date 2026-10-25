@@ -1,4 +1,6 @@
-//! 从默认 Chromium 系浏览器导入登录 cookies（用户显式触发，design.md §2.5）。
+//! 从默认 Chromium 系浏览器导入登录 cookies（design.md §2.5）。
+//! 两条入口共用 [`import`]：启动自动导入 [`import_auto`]（每进程一次，
+//! App mount 后前端触发）与手动导入（🔑 ImportDialog，用户确认后可反复重试）。
 //!
 //! 范围（有意收窄）：
 //! - 只识别默认浏览器是否为 Chromium 系（Chrome / Edge / Brave / Vivaldi / Opera /
@@ -27,14 +29,16 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::Mutex;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde::Serialize;
 use tauri::{AppHandle, Manager, Wry};
 use zeroize::Zeroizing;
 
+use crate::local_storage_db::{self, LsEntry};
 use crate::sites::SiteConfig;
 use crate::tabs::Tabs;
 
@@ -50,6 +54,8 @@ pub const E_BROWSER_DATA_TCC_DENIED: &str = "E_BROWSER_DATA_TCC_DENIED";
 pub const E_COOKIE_DB_LOCKED: &str = "E_COOKIE_DB_LOCKED";
 pub const E_DECRYPT_FAILED: &str = "E_DECRYPT_FAILED";
 pub const E_INJECT_FAILED: &str = "E_INJECT_FAILED";
+/// 仅自动导入路径：本进程已尝试过一次（前端收到后应静默忽略，不弹窗）
+pub const E_AUTO_ALREADY_RUN: &str = "E_AUTO_ALREADY_RUN";
 
 /// 带 "E_XXX" 错误码的导入失败（commands 层拼成 "code: message" 给前端）
 #[derive(Debug)]
@@ -65,6 +71,20 @@ impl ImportError {
             message: message.into(),
         }
     }
+}
+
+// ---------- 诊断日志 ----------
+//
+// 每个阶段一条 `[import]` 结构化日志（对齐 [tabs] / [preload] 的既有风格），
+// 用于真机定位「导入不生效」卡在哪个环节。FAMA_DEBUG_IMPORT=1 时额外打印
+// 每条 cookie 的 host/name/属性（永不打印 value）。
+
+fn debug_import() -> bool {
+    std::env::var("FAMA_DEBUG_IMPORT").as_deref() == Ok("1")
+}
+
+macro_rules! ilog {
+    ($($arg:tt)*) => { eprintln!("[import] {}", format_args!($($arg)*)) };
 }
 
 // ---------- 浏览器映射 ----------
@@ -198,9 +218,14 @@ fn derived_key_for(browser: &ChromiumBrowser) -> Result<Zeroizing<[u8; 16]>, Imp
     {
         let mut guard = DERIVED_KEYS.lock().unwrap();
         if let Some(k) = guard.get_or_insert_with(DerivedKeyCache::new).get(browser.name) {
+            ilog!("keychain: reusing cached derived key (no ACL prompt)");
             return Ok(k.clone());
         }
     }
+    ilog!(
+        "keychain: reading \"{}\" (macOS 会弹 ACL 授权框，等待用户应答…)",
+        browser.safe_storage_service
+    );
     let secret: Zeroizing<Vec<u8>> =
         match security_framework::passwords::get_generic_password(
             browser.safe_storage_service,
@@ -264,6 +289,20 @@ pub(crate) fn decrypt_v10(key: &[u8; 16], encrypted: &[u8]) -> Result<Vec<u8>, D
         .map_err(|_| DecryptError::BadPadding)
 }
 
+/// Edge 156+（实测 156.0.4314.42，macOS 版 app-bound 等价方案）：v10 解密后
+/// 的明文不是 cookie 值，而是 `SHA-256(host_key)[32B] + value`——与 Windows
+/// v20 的 domain hash 前缀同款（不同 host_key 的前缀不同，可精确校验）。
+/// hash 匹配 → 返回剥掉前缀后的值；不匹配（旧版无前缀格式）→ None，
+/// 调用方按「明文即值」的旧格式处理。
+fn strip_domain_hash_prefix<'a>(plain: &'a [u8], host_key: &str) -> Option<&'a [u8]> {
+    use sha2::{Digest, Sha256};
+    if plain.len() < 32 {
+        return None;
+    }
+    let hash = Sha256::digest(host_key.as_bytes());
+    plain.strip_prefix(hash.as_slice())
+}
+
 // ---------- 时间与 host 匹配 ----------
 
 /// Chromium cookies 表时间戳（1601-01-01 起的微秒数）→ Unix epoch 秒（NSDate 用）
@@ -289,6 +328,49 @@ pub(crate) fn host_matches(cookie_host: &str, site_host: &str) -> bool {
 }
 
 // ---------- Cookies 数据库读取 ----------
+
+/// skip 计数（按原因细分，「不再有不可解释的 skipped_other」）。
+/// expired / utf8 / decrypt / read 四类是真正跳过不导入；
+/// `expires_unknown` 特殊：expires_utc 列读不出有效数值（NULL / 类型不符）
+/// 的条目不丢弃、按会话 cookie 保留，单独计数供日志定位 schema 异常。
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SkipStats {
+    /// has_expires 且换算后的 expires_utc 已过当前时间
+    pub expired: usize,
+    /// 解密后的明文不是合法 UTF-8
+    pub utf8: usize,
+    /// v10 解密失败（非 v10 / 长度 / padding）
+    pub decrypt: usize,
+    /// host_key 等关键列读取失败
+    pub read: usize,
+    /// expires_utc 读不出有效数值但保留（会话 cookie）的条数
+    pub expires_unknown: usize,
+}
+
+impl SkipStats {
+    /// 对应 ImportReport.skipped_other 的既有语义（未导入且非解密失败）
+    fn other(&self) -> usize {
+        self.expired + self.utf8 + self.read
+    }
+}
+
+/// SQLite 值宽松读 i64。Chromium 的 expires_utc 等时间戳列历史上是 INTEGER，
+/// 但新版本 / 分支（如 Edge 156 实测出现整库误判过期）可能读出 NULL、REAL
+/// 或 TEXT；用 `unwrap_or(0)` 静默成 0 会被过期判断换算成 1601 年附近而误杀。
+/// INTEGER 直取；REAL / TEXT 尝试按整数数值解释；NULL / 其余 → None。
+fn value_ref_as_i64(v: rusqlite::types::ValueRef<'_>) -> Option<i64> {
+    use rusqlite::types::ValueRef;
+    match v {
+        ValueRef::Integer(i) => Some(i),
+        ValueRef::Real(f) if f.is_finite() && f.fract() == 0.0 && f.abs() < 9.2e18 => {
+            Some(f as i64)
+        }
+        ValueRef::Text(t) => std::str::from_utf8(t)
+            .ok()
+            .and_then(|s| s.trim().parse::<i64>().ok()),
+        ValueRef::Null | ValueRef::Real(_) | ValueRef::Blob(_) => None,
+    }
+}
 
 /// 解密前从数据库读到的一条 cookie
 #[derive(Debug, Clone)]
@@ -496,13 +578,15 @@ fn open_cookie_copy(
     Ok((conn, guard))
 }
 
-/// 查询 + host 过滤 + 解密。返回 (matched, skipped_decrypt, skipped_other, cookies)
-#[allow(clippy::type_complexity)]
+/// 查询 + host 过滤 + 解密。返回 (matched, skip 细分计数, cookies)。
+/// 每条被跳过的 cookie 在 FAMA_DEBUG_IMPORT=1 时打印原因与关键字段
+/// （expires_utc 原始值 / 换算 unix 秒 / now / 解密错误类别 / 明文前 8 字节
+/// hex），永不打印完整 value。
 fn read_and_decrypt(
     conn: &rusqlite::Connection,
     key: &[u8; 16],
     site_hosts: &[String],
-) -> Result<(usize, usize, usize, Vec<RawCookie>), ImportError> {
+) -> Result<(usize, SkipStats, Vec<RawCookie>), ImportError> {
     let now_unix = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs_f64())
@@ -514,11 +598,35 @@ fn read_and_decrypt(
         )
         .map_err(|e| ImportError::new(E_COOKIE_DB_LOCKED, format!("查询 cookies 表失败: {e}")))?;
 
+    // 侦察日志（每库一次，debug 时）：schema 原文 + 库的新旧。定位新版本
+    // 浏览器 schema / 列类型变化（列存在但值形态异常）与「读到已弃用旧库」
+    // （条目真实过期）两类不同的整库异常。
+    if debug_import() {
+        if let Ok(sql) = conn.query_row(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='cookies'",
+            [],
+            |r| r.get::<_, String>(0),
+        ) {
+            ilog!("db schema: {sql}");
+        }
+        if let Ok((rows, max_access)) = conn.query_row(
+            "SELECT COUNT(*), IFNULL(MAX(last_access_utc), 0) FROM cookies",
+            [],
+            |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)),
+        ) {
+            ilog!(
+                "db stats: rows={rows} max_last_access_utc={max_access} (≈ unix {})",
+                chromium_utc_to_unix_secs(max_access)
+            );
+        }
+    }
+
     let mut rows = stmt
         .query([])
         .map_err(|e| ImportError::new(E_COOKIE_DB_LOCKED, format!("遍历 cookies 表失败: {e}")))?;
 
-    let (mut matched, mut skipped_decrypt, mut skipped_other) = (0, 0, 0);
+    let mut matched = 0;
+    let mut skips = SkipStats::default();
     let mut cookies = Vec::new();
     loop {
         let row = match rows.next() {
@@ -533,8 +641,11 @@ fn read_and_decrypt(
         };
         let host_key: String = match row.get(0) {
             Ok(v) => v,
-            Err(_) => {
-                skipped_other += 1;
+            Err(e) => {
+                if debug_import() {
+                    ilog!("skip read: col=host_key err={e}");
+                }
+                skips.read += 1;
                 continue;
             }
         };
@@ -546,15 +657,47 @@ fn read_and_decrypt(
         let value: String = row.get(2).unwrap_or_default();
         let encrypted: Vec<u8> = row.get(3).unwrap_or_default();
         let path: String = row.get(4).unwrap_or_else(|_| "/".to_string());
-        let expires_utc: i64 = row.get(5).unwrap_or(0);
+        // expires_utc / has_expires 宽松读取：读不出有效数值（NULL / 类型
+        // 不符），或 expires_utc=0 却声明 has_expires=1 的矛盾行（旧逻辑把
+        // 0 换算到 1601 年附近 → 整库误杀的最大嫌疑形态），都不再判过期，
+        // 改按「无有效期信息」保留为会话 cookie，并计数 + 记原始值形态供诊断。
+        // expires_utc=0 且 has_expires=0 是正常会话 cookie，不计数。
+        let has_expires_col: bool = row.get::<_, i64>(8).map(|v| v != 0).unwrap_or(false);
+        let expires_raw: Option<i64> = row.get_ref(5).ok().and_then(value_ref_as_i64);
+        let (expires_utc, has_expires) = match expires_raw {
+            Some(v) if v != 0 => (v, has_expires_col),
+            _ => {
+                // expires_utc=0 且 has_expires=0 是正常会话 cookie，不计数不打日志
+                if has_expires_col || expires_raw.is_none() {
+                    skips.expires_unknown += 1;
+                    if debug_import() {
+                        let raw = row
+                            .get_ref(5)
+                            .map(|v| format!("{v:?}"))
+                            .unwrap_or_else(|e| format!("读列失败: {e}"));
+                        ilog!(
+                            "expires unknown: host={host_key} name={name} raw={raw} \
+                             has_expires_col={has_expires_col}"
+                        );
+                    }
+                }
+                (0, false)
+            }
+        };
         let is_secure: bool = row.get::<_, i64>(6).map(|v| v != 0).unwrap_or(false);
         let is_httponly: bool = row.get::<_, i64>(7).map(|v| v != 0).unwrap_or(false);
-        let has_expires: bool = row.get::<_, i64>(8).map(|v| v != 0).unwrap_or(false);
         let samesite: i64 = row.get(9).unwrap_or(-1);
 
-        // 过期 cookie 不导入
+        // 过期 cookie 不导入（换算值与当前时间都打进日志，真凶一眼可见）
         if has_expires && chromium_utc_to_unix_secs(expires_utc) <= now_unix {
-            skipped_other += 1;
+            if debug_import() {
+                ilog!(
+                    "skip expired: host={host_key} name={name} has_expires=true \
+                     expires_utc={expires_utc} unix={} now_unix={now_unix}",
+                    chromium_utc_to_unix_secs(expires_utc)
+                );
+            }
+            skips.expired += 1;
             continue;
         }
         let plain: Vec<u8> = if encrypted.is_empty() {
@@ -562,16 +705,35 @@ fn read_and_decrypt(
         } else {
             match decrypt_v10(key, &encrypted) {
                 Ok(p) => p,
-                Err(_) => {
-                    skipped_decrypt += 1;
+                Err(e) => {
+                    if debug_import() {
+                        ilog!(
+                            "skip decrypt: host={host_key} name={name} enc_len={} reason={e:?}",
+                            encrypted.len()
+                        );
+                    }
+                    skips.decrypt += 1;
                     continue;
                 }
             }
         };
-        let value_str = match String::from_utf8(plain) {
-            Ok(s) => s,
+        // Edge 156+：v10 明文带 SHA-256(host_key) 前缀，先剥掉再当值；
+        // hash 不匹配（旧格式）按整段明文当值
+        let body: &[u8] = strip_domain_hash_prefix(&plain, &host_key).unwrap_or(&plain);
+        let value_str = match std::str::from_utf8(body) {
+            Ok(s) => s.to_string(),
             Err(_) => {
-                skipped_other += 1;
+                if debug_import() {
+                    // 明文前 8 字节 hex 足以判断格式，永不打印完整 value
+                    let head: Vec<String> =
+                        plain.iter().take(8).map(|b| format!("{b:02x}")).collect();
+                    ilog!(
+                        "skip utf8: host={host_key} name={name} plain_len={} plain_head=[{}]",
+                        plain.len(),
+                        head.join(" ")
+                    );
+                }
+                skips.utf8 += 1;
                 continue;
             }
         };
@@ -587,7 +749,7 @@ fn read_and_decrypt(
             samesite,
         });
     }
-    Ok((matched, skipped_decrypt, skipped_other, cookies))
+    Ok((matched, skips, cookies))
 }
 
 // ---------- 多 profile 扫描与合并 ----------
@@ -611,8 +773,8 @@ struct ScanOutcome {
     profiles_scanned: Vec<String>,
     /// 各 profile host 匹配行数之和
     matched: usize,
-    skipped_decrypt: usize,
-    skipped_other: usize,
+    /// skip 细分计数（各 profile 求和）
+    skips: SkipStats,
     /// (host_key, name) 去重合并后的 cookie
     cookies: Vec<RawCookie>,
 }
@@ -634,8 +796,7 @@ fn scan_all_profiles(
     let mut out = ScanOutcome {
         profiles_scanned: Vec::new(),
         matched: 0,
-        skipped_decrypt: 0,
-        skipped_other: 0,
+        skips: SkipStats::default(),
         cookies: Vec::new(),
     };
     let mut seen_dbs: HashSet<PathBuf> = HashSet::new();
@@ -644,32 +805,52 @@ fn scan_all_profiles(
     let mut first_err: Option<ImportError> = None;
 
     for profile in &scan.profiles {
-        let Some(db) = find_cookie_db(base, profile) else { continue };
+        let Some(db) = find_cookie_db(base, profile) else {
+            ilog!("profile {profile}: no cookies db candidate found");
+            continue;
+        };
         if !seen_dbs.insert(db.clone()) {
             continue;
         }
         out.profiles_scanned.push(profile.clone());
+        ilog!("profile {profile}: db {}", db.display());
         let (conn, _guard) = match open_cookie_copy(&db, browser_name, scan.local_state_denied) {
             Ok(v) => v,
             // TCC：一次失败即整体返回
             Err(e) if e.code == E_BROWSER_DATA_TCC_DENIED => return Err(e),
             // 单 profile 失败不影响其他 profile
             Err(e) => {
+                ilog!("profile {profile}: open copy failed: {}", e.message);
                 first_err.get_or_insert(e);
                 continue;
             }
         };
         match read_and_decrypt(&conn, key, site_hosts) {
-            Ok((matched, skipped_decrypt, skipped_other, cookies)) => {
+            Ok((matched, skips, cookies)) => {
                 read_ok_any = true;
                 out.matched += matched;
-                out.skipped_decrypt += skipped_decrypt;
-                out.skipped_other += skipped_other;
+                out.skips.expired += skips.expired;
+                out.skips.utf8 += skips.utf8;
+                out.skips.decrypt += skips.decrypt;
+                out.skips.read += skips.read;
+                out.skips.expires_unknown += skips.expires_unknown;
+                ilog!(
+                    "profile {profile}: matched={matched} kept={} \
+                     skipped_expired={} skipped_utf8={} skipped_decrypt={} skipped_read={} \
+                     expires_unknown={}",
+                    cookies.len(),
+                    skips.expired,
+                    skips.utf8,
+                    skips.decrypt,
+                    skips.read,
+                    skips.expires_unknown
+                );
                 for c in cookies {
                     push_dedup(&mut out.cookies, &mut seen_keys, c);
                 }
             }
             Err(e) => {
+                ilog!("profile {profile}: read failed: {}", e.message);
                 first_err.get_or_insert(e);
             }
         }
@@ -701,6 +882,209 @@ fn scan_all_profiles(
     Ok(out)
 }
 
+// ---------- localStorage 导入（kimi 等不走 cookie 认证的站点） ----------
+//
+// 实证结论（2026-10-25，本机 Edge 156 + Chromium master 源码双重确认，
+// 见 design.md §2.5.2）：Next.js SPA 类站点（kimi）登录 token 不在 cookie，
+// 在 localStorage（LevelDB 键 `_https://www.kimi.com\0\x01access_token`）。
+// 站点通过 sites.toml 的 `import_local_storage = true` 逐站点开启本路径，
+// 与 cookie 流程共用浏览器检测 / profile 枚举 / TCC 分类 / 授权模型。
+
+/// 站点 URL → localStorage origin（`scheme://host[:port]`，非默认端口才带）。
+/// LevelDB 键按 origin 精确前缀匹配（www 与裸域是不同 origin，不做子域放宽）
+fn origin_of(url: &url::Url) -> Option<String> {
+    let host = url.host_str()?;
+    Some(match url.port() {
+        Some(p) => format!("{}://{host}:{p}", url.scheme()),
+        None => format!("{}://{host}", url.scheme()),
+    })
+}
+
+/// localStorage leveldb 目录候选（有序）：profile 布局优先，数据根兜底
+/// （Opera 无 profile 子目录，localStorage 挂在数据根下，同 Cookies 布局差异）
+fn ls_db_candidates(base: &Path, profile: &str) -> Vec<PathBuf> {
+    vec![
+        base.join(profile)
+            .join("Local Storage")
+            .join("leveldb"),
+        base.join("Local Storage").join("leveldb"),
+    ]
+}
+
+/// 逐 profile 扫描 localStorage，提取各站点 origin 下的键值。
+/// - 复用 cookie 流程的 profile 枚举（`Local State` 的 last_used 优先）；
+///   实测 kimi token 位于非 Default profile，多 profile 扫描是硬要求；
+/// - 同一目录路径只读一次（数据根布局会被多个 profile 的候选命中）；
+/// - 直接读源文件（不复制）：LevelDB 是追加型日志结构，只读解析器容忍
+///   torn write，读不到的最后几条由浏览器下次写入补齐，无损坏风险；
+/// - 键按站点去重，先扫到的 profile 优先（last_used 在前，与 cookie 一致）；
+/// - 权限拒绝（TCC）→ 整体失败（与 cookie 路径同一错误码）；目录缺失 /
+///   其他 IO 错误 → 记日志跳过该目录；
+/// - 数据安全：value 永不落日志（FAMA_DEBUG_IMPORT 下也只打键名+长度）。
+///
+/// 返回（site_id → 该站点去重后的条目，总条数）。
+fn scan_local_storage(
+    base: &Path,
+    scan: &ProfileScan,
+    browser_name: &str,
+    ls_targets: &[&SiteConfig],
+) -> Result<(HashMap<String, Vec<LsEntry>>, usize), ImportError> {
+    let targets: Vec<(&str, String)> = ls_targets
+        .iter()
+        .filter_map(|t| {
+            origin_of(&t.url).map(|o| (t.id.as_str(), o))
+        })
+        .collect();
+    if targets.is_empty() {
+        return Ok((HashMap::new(), 0));
+    }
+
+    let mut out: HashMap<String, Vec<LsEntry>> = HashMap::new();
+    let mut seen_keys: HashMap<&str, HashSet<String>> = HashMap::new();
+    let mut seen_dirs: HashSet<PathBuf> = HashSet::new();
+
+    for profile in &scan.profiles {
+        for dir in ls_db_candidates(base, profile) {
+            if !dir.is_dir() || !seen_dirs.insert(dir.clone()) {
+                continue;
+            }
+            ilog!("ls: profile {profile}: leveldb {}", dir.display());
+            for (site_id, origin) in &targets {
+                match local_storage_db::read_origin_entries(&dir, origin) {
+                    Ok(entries) => {
+                        let site_entries = out.entry(site_id.to_string()).or_default();
+                        let seen = seen_keys.entry(site_id).or_default();
+                        for e in entries {
+                            if seen.insert(e.key.clone()) {
+                                site_entries.push(e);
+                            }
+                        }
+                    }
+                    // TCC：一次失败即整体返回（与 cookie 路径同语义）
+                    Err(local_storage_db::LsError::Denied(e)) => {
+                        ilog!("ls: {site_id}: read {origin} denied: {e}");
+                        return Err(tcc_denied(browser_name, "localStorage 数据"));
+                    }
+                    Err(local_storage_db::LsError::Io(e)) => {
+                        ilog!("ls: {site_id}: read {origin} failed: {e}");
+                    }
+                    // Missing = 该 profile 无 localStorage 目录内容，正常跳过
+                    Err(local_storage_db::LsError::Missing) => {}
+                }
+            }
+        }
+    }
+
+    let mut total = 0;
+    for (site_id, origin) in &targets {
+        let entries = out.get(*site_id).map(|v| v.len()).unwrap_or(0);
+        total += entries;
+        // 永不打 value；键名+长度只在 FAMA_DEBUG_IMPORT 下打印（截断防刷屏）
+        if debug_import() {
+            if let Some(list) = out.get(*site_id) {
+                let mut parts: Vec<String> = list
+                    .iter()
+                    .take(50)
+                    .map(|e| format!("{}({})", e.key, e.value.len()))
+                    .collect();
+                if list.len() > 50 {
+                    parts.push(format!("…共 {} 条", list.len()));
+                }
+                ilog!("ls: site={site_id} origin={origin} keys=[{}]", parts.join(", "));
+            }
+        }
+    }
+    ilog!(
+        "ls total: {}",
+        targets
+            .iter()
+            .map(|(id, _)| format!("{id}={}", out.get(*id).map(|v| v.len()).unwrap_or(0)))
+            .collect::<Vec<_>>()
+            .join(" ")
+    );
+    Ok((out, total))
+}
+
+/// 生成在站点页面上下文执行的注入脚本：批量 `localStorage.setItem`。
+/// - 首行 `// entries: N` 注释供 tabs::ls_scripts_entry_count 计数
+///   （eval 无同步返回值，注入条数以此统计进 ImportReport）；
+/// - 键值经 serde_json 转义后内嵌，任意字符（引号/换行/非 ASCII）安全；
+/// - 每条 setItem 独立 try/catch，单键失败（如配额）不中断其余；
+/// - 注入是否生效由后续 reload + 页面登录态体现，报告/前端可见非静默。
+fn build_ls_inject_js(entries: &[LsEntry]) -> String {
+    let pairs: Vec<(&str, &str)> = entries
+        .iter()
+        .map(|e| (e.key.as_str(), e.value.as_str()))
+        .collect();
+    let json = serde_json::to_string(&pairs).unwrap_or_else(|_| "[]".to_string());
+    format!(
+        "// entries: {}\n(function(){{try{{var d={};\
+for(var i=0;i<d.length;i++){{try{{localStorage.setItem(d[i][0],d[i][1])}}catch(e){{}}}}\
+}}catch(e){{}}}})();",
+        entries.len(),
+        json
+    )
+}
+
+/// FAMA_DEBUG_IMPORT=1 的注入回读验证探针：把「注入的 t 个键中现存 p 个」
+/// 写进 URL fragment（SPA 改 hash 不触发导航，Rust 侧轮询 wv.url() 读回）。
+/// 只回读计数，**永不回读 value**。
+fn ls_verify_probe_js(keys: &[String]) -> String {
+    let json = serde_json::to_string(keys).unwrap_or_else(|_| "[]".to_string());
+    format!(
+        "(function(){{try{{var ks={json};var p=0,t=0;\
+for(var i=0;i<ks.length;i++){{t++;if(localStorage.getItem(ks[i])!==null)p++;}}\
+history.replaceState(null,'','#fama-ls-verify='+p+'/'+t);}}catch(e){{}}}})();"
+    )
+}
+
+/// 注入回读验证（仅 FAMA_DEBUG_IMPORT=1；kimi 是 SPA，登录与否不改变 URL，
+/// 这是不依赖 URL 的更强证据）：延迟等 reload / 首载完成，eval 探针后轮询
+/// fragment。两轮尝试覆盖页面加载慢的情况；任何失败只打日志，不影响导入
+/// 结果（线程 detached，进程正常生命周期内完成）。
+fn spawn_ls_verify(app: AppHandle<Wry>, ls_keys: Vec<(String, Vec<String>)>) {
+    std::thread::spawn(move || {
+        let tabs = app.state::<Tabs>();
+        for (site_id, keys) in &ls_keys {
+            let mut verified = false;
+            for attempt in 0..2 {
+                // 每轮先等 reload/首载推进（首轮 eval 可能被导航吞掉，次轮兜底）
+                std::thread::sleep(Duration::from_secs(6));
+                if !tabs.eval_probe_if_loaded(site_id, &ls_verify_probe_js(keys)) {
+                    ilog!(
+                        "ls verify: {site_id}: attempt {}: 页面未就绪或 eval 失败",
+                        attempt + 1
+                    );
+                    continue;
+                }
+                let deadline = Instant::now() + Duration::from_secs(4);
+                loop {
+                    if let Some(f) = tabs.url_fragment(&app, site_id) {
+                        if let Some(rest) = f.strip_prefix("fama-ls-verify=") {
+                            ilog!(
+                                "ls verify: {site_id}: present={rest}                                  （reload 后 webview localStorage 回读计数）"
+                            );
+                            verified = true;
+                            break;
+                        }
+                    }
+                    if Instant::now() >= deadline {
+                        ilog!("ls verify: {site_id}: attempt {}: 回读超时", attempt + 1);
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(150));
+                }
+                if verified {
+                    break;
+                }
+            }
+            if !verified {
+                ilog!("ls verify: {site_id}: 未能回读（页面加载慢或站点改写了 hash）");
+            }
+        }
+    });
+}
+
 // ---------- 注入 WKHTTPCookieStore ----------
 
 /// 把一条 RawCookie 转成 NSHTTPCookie；返回 None 表示属性无法构造。
@@ -724,13 +1108,11 @@ unsafe fn build_ns_cookie(
                 ns_string!("Name"),
                 ns_string!("Value"),
                 ns_string!("Path"),
-                ns_string!("Version"),
             ],
             &[
                 &*name as &AnyObject,
                 &*value as &AnyObject,
                 &*path as &AnyObject,
-                &*NSString::from_str("0") as &AnyObject,
             ],
         );
     // 域 cookie（host_key 带前导 '.'）用 Domain；host-only cookie 用 OriginURL，
@@ -746,6 +1128,9 @@ unsafe fn build_ns_cookie(
     if c.has_expires && c.expires_utc != 0 {
         let dt = NSDate::dateWithTimeIntervalSince1970(chromium_utc_to_unix_secs(c.expires_utc));
         props.insert(ns_string!("Expires"), &*dt as &AnyObject);
+        // Version 与 Expires 成对设置（对齐 wry cookie_into_wkwebview 的既有组合；
+        // 会话 cookie 不设 Version）
+        props.insert(ns_string!("Version"), &NSString::from_str("0") as &AnyObject);
     }
     if c.is_secure {
         props.insert(ns_string!("Secure"), ns_string!("TRUE") as &AnyObject);
@@ -843,17 +1228,34 @@ pub struct ImportReport {
     pub skipped_other: usize,
     /// 注入后触发 reload 的站点 id
     pub reloaded: Vec<String>,
+    /// localStorage 扫描读到的条目数（import_local_storage 站点，跨 profile 去重）
+    pub ls_read: usize,
+    /// 已加载页面上立即 eval 注入的 localStorage 条数
+    pub ls_injected: usize,
+    /// 挂起待站点首次加载完成注入的 localStorage 条数（含在 ls_read 内）
+    pub ls_pending: usize,
 }
 
-/// 完整导入流程。调用前提：用户已在前端确认框同意（第一道授权）；
+/// 完整导入流程。手动导入（🔑）调用前提：用户已在前端确认框同意（第一道授权）；
 /// Keychain ACL 弹窗（第二道授权）由系统在本函数读 Safe Storage 时弹出。
+/// 启动自动导入走 [`import_auto`]（无确认框，Keychain 弹窗即用户感知点）。
 pub fn import(app: &AppHandle<Wry>, targets: &[SiteConfig]) -> Result<ImportReport, ImportError> {
     if targets.is_empty() {
         return Err(ImportError::new(E_NO_SITES, "未选择任何有效站点"));
     }
+    ilog!(
+        "start: {} sites ({})",
+        targets.len(),
+        targets
+            .iter()
+            .map(|t| t.id.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
 
     // 1. 识别默认浏览器（不支持的浏览器在这里就返回，不触发 Keychain）
     let bundle_id = detect_default_browser_bundle_id(app)?;
+    ilog!("default browser bundle id: {bundle_id}");
     let browser = browser_for_bundle_id(&bundle_id).ok_or_else(|| {
         ImportError::new(
             E_UNSUPPORTED_BROWSER,
@@ -866,6 +1268,7 @@ pub fn import(app: &AppHandle<Wry>, targets: &[SiteConfig]) -> Result<ImportRepo
 
     // 2. Keychain 读取 + 派生 key（有本次运行缓存）
     let key = derived_key_for(browser)?;
+    ilog!("keychain: derived cookie key ok");
 
     // 3. 定位用户数据目录（TCC 下元数据访问仍可用，is_dir 不会被拦截）
     let base = app
@@ -875,11 +1278,13 @@ pub fn import(app: &AppHandle<Wry>, targets: &[SiteConfig]) -> Result<ImportRepo
         .join("Library/Application Support")
         .join(browser.data_dir);
     if !base.is_dir() {
+        ilog!("data dir missing: {}", base.display());
         return Err(ImportError::new(
             E_BROWSER_DATA_MISSING,
             format!("未找到 {} 的用户数据目录 {}", browser.name, base.display()),
         ));
     }
+    ilog!("data dir: {}", base.display());
 
     // 4. 多 profile 枚举 + 逐一扫描（副本查询 + host 过滤 + 解密 + 去重合并）。
     //    TCC 权限拒绝（Local State / Cookies 复制 EPERM）在这里以
@@ -888,14 +1293,50 @@ pub fn import(app: &AppHandle<Wry>, targets: &[SiteConfig]) -> Result<ImportRepo
         .iter()
         .filter_map(|t| t.url.host_str().map(|h| h.to_string()))
         .collect();
+    ilog!("site hosts: {}", site_hosts.join(", "));
     let scan = list_profiles(&base);
+    ilog!(
+        "profiles: {:?} (local_state_denied: {})",
+        scan.profiles,
+        scan.local_state_denied
+    );
     let outcome = scan_all_profiles(&base, &scan, browser.name, &key, &site_hosts)?;
+    ilog!(
+        "scan total: matched={} kept={} skipped_expired={} skipped_utf8={} \
+         skipped_decrypt={} skipped_read={} expires_unknown={}",
+        outcome.matched,
+        outcome.cookies.len(),
+        outcome.skips.expired,
+        outcome.skips.utf8,
+        outcome.skips.decrypt,
+        outcome.skips.read,
+        outcome.skips.expires_unknown
+    );
+    if debug_import() {
+        for c in &outcome.cookies {
+            ilog!(
+                "cookie host={} name={} secure={} httponly={} samesite={} expires_utc={} has_expires={}",
+                c.host_key,
+                c.name,
+                c.is_secure,
+                c.is_httponly,
+                c.samesite,
+                c.expires_utc,
+                c.has_expires
+            );
+        }
+    }
 
     // 5. 注入默认 data store（所有站点 webview 共享，见 design.md §2.5）
     let (injected, skipped_build) = inject_cookies(app, outcome.cookies)?;
-    let skipped_other = outcome.skipped_other + skipped_build;
+    ilog!(
+        "inject: set={} skipped_build={}",
+        injected,
+        skipped_build
+    );
+    let skipped_other = outcome.skips.other() + skipped_build;
 
-    if outcome.matched > 0 && injected == 0 && outcome.skipped_decrypt == outcome.matched {
+    if outcome.matched > 0 && injected == 0 && outcome.skips.decrypt == outcome.matched {
         return Err(ImportError::new(
             E_DECRYPT_FAILED,
             format!(
@@ -905,10 +1346,59 @@ pub fn import(app: &AppHandle<Wry>, targets: &[SiteConfig]) -> Result<ImportRepo
         ));
     }
 
-    // 6. reload 已加载的站点页面，让登录态立即生效
-    let site_ids: Vec<String> = targets.iter().map(|t| t.id.clone()).collect();
-    let reloaded = app.state::<Tabs>().reload_loaded(&site_ids);
+    // 6. localStorage 扫描（仅 import_local_storage 站点，kimi 等 SPA 的
+    //    登录 token 在 localStorage 不在 cookie）。与 cookie 共用 profile
+    //    枚举与 TCC 分类；读不到条目不算失败（可能该浏览器未登录过），
+    //    数量进报告由前端可见呈现，不静默。
+    let ls_targets: Vec<&SiteConfig> =
+        targets.iter().filter(|t| t.import_local_storage).collect();
+    let (ls_entries, ls_read) = if ls_targets.is_empty() {
+        (HashMap::new(), 0)
+    } else {
+        ilog!("ls sites: {}", ls_targets.iter().map(|t| t.id.as_str()).collect::<Vec<_>>().join(", "));
+        scan_local_storage(&base, &scan, browser.name, &ls_targets)?
+    };
 
+    // 7. reload 已加载的站点页面，让登录态立即生效；尚未完成首载的页面由
+    //    Tabs 的 pending_reload / pending_ls 在首载完成时补注入+reload
+    //    （导航请求可能早于注入发出，不带新登录态）。localStorage 站点
+    //    先 eval setItem 再 reload，一次刷新同时生效 cookie 与 localStorage。
+    let site_ids: Vec<String> = targets.iter().map(|t| t.id.clone()).collect();
+    let ls_scripts: HashMap<String, String> = ls_entries
+        .iter()
+        .filter(|(_, v)| !v.is_empty())
+        .map(|(id, v)| (id.clone(), build_ls_inject_js(v)))
+        .collect();
+    let rl = app.state::<Tabs>().reload_loaded(&site_ids, &ls_scripts);
+    ilog!(
+        "reload now: {:?} (未就绪站点转入 pending_reload/pending_ls)",
+        rl.reloaded
+    );
+    if !ls_scripts.is_empty() {
+        ilog!(
+            "ls inject: now={} pending={} (待站点首载完成)",
+            rl.ls_injected_now, rl.ls_pending
+        );
+        // FAMA_DEBUG_IMPORT：延迟回读验证（只回读键存在计数，不回读 value）
+        if debug_import() {
+            let ls_keys: Vec<(String, Vec<String>)> = ls_entries
+                .iter()
+                .filter(|(_, v)| !v.is_empty())
+                .map(|(id, v)| (id.clone(), v.iter().map(|e| e.key.clone()).collect()))
+                .collect();
+            spawn_ls_verify(app.clone(), ls_keys);
+        }
+    }
+
+    ilog!(
+        "done: browser={} profiles={:?} injected={} ls_read={} ls_injected={} ls_pending={}",
+        browser.name,
+        outcome.profiles_scanned,
+        injected,
+        ls_read,
+        rl.ls_injected_now,
+        rl.ls_pending
+    );
     Ok(ImportReport {
         browser: browser.name.to_string(),
         profile: outcome
@@ -919,10 +1409,43 @@ pub fn import(app: &AppHandle<Wry>, targets: &[SiteConfig]) -> Result<ImportRepo
         profiles_scanned: outcome.profiles_scanned,
         matched: outcome.matched,
         injected,
-        skipped_decrypt: outcome.skipped_decrypt,
+        skipped_decrypt: outcome.skips.decrypt,
         skipped_other,
-        reloaded,
+        reloaded: rl.reloaded,
+        ls_read,
+        ls_injected: rl.ls_injected_now,
+        ls_pending: rl.ls_pending,
     })
+}
+
+// ---------- 启动自动导入（每进程至多一次） ----------
+
+/// 自动导入是否已在本进程尝试过的守卫。防止 dev 下前端热重载反复触发
+/// （每次都会重新读浏览器 DB；未授权时反复弹 Keychain ACL 框）。
+/// 手动导入（🔑 ImportDialog）不受此守卫限制，始终可重试。
+static AUTO_IMPORT_ATTEMPTED: AtomicBool = AtomicBool::new(false);
+
+/// check-and-set：返回 true 表示本进程已经自动导入过（本次调用被拒绝）。
+fn auto_import_gate() -> bool {
+    AUTO_IMPORT_ATTEMPTED.swap(true, Ordering::SeqCst)
+}
+
+/// 启动时自动导入（App mount 后前端触发）：与手动导入同流程，仅多一道
+/// 每进程一次的守卫。已尝试过则返回 `E_AUTO_ALREADY_RUN`（前端静默忽略）。
+/// 首次运行时 Keychain ACL 弹窗（若未「始终允许」）就是用户感知与授权点。
+pub fn import_auto(
+    app: &AppHandle<Wry>,
+    targets: &[SiteConfig],
+) -> Result<ImportReport, ImportError> {
+    if auto_import_gate() {
+        ilog!("auto: already attempted in this process, skipping");
+        return Err(ImportError::new(
+            E_AUTO_ALREADY_RUN,
+            "本进程已执行过一次自动导入",
+        ));
+    }
+    ilog!("auto: startup import begin");
+    import(app, targets)
 }
 
 // ---------- 单元测试 ----------
@@ -1110,12 +1633,15 @@ mod tests {
         insert(".kimi.com", "future", "", b"v20deadbeef".to_vec(), far_future);
 
         let hosts = vec!["www.kimi.com".to_string(), "chatgpt.com".to_string()];
-        let (matched, skipped_decrypt, skipped_other, cookies) =
-            read_and_decrypt(&conn, &key, &hosts).unwrap();
+        let (matched, skips, cookies) = read_and_decrypt(&conn, &key, &hosts).unwrap();
 
         assert_eq!(matched, 4); // .kimi.com 的 4 条（不含 example.com）
-        assert_eq!(skipped_decrypt, 1); // v20
-        assert_eq!(skipped_other, 1); // 过期
+        assert_eq!(skips.decrypt, 1); // v20
+        assert_eq!(skips.expired, 1); // 2000 年
+        assert_eq!(skips.utf8, 0);
+        assert_eq!(skips.read, 0);
+        assert_eq!(skips.expires_unknown, 0);
+        assert_eq!(skips.other(), 1);
         assert_eq!(cookies.len(), 2);
         let session = cookies.iter().find(|c| c.name == "session").unwrap();
         assert_eq!(session.value, "tok-abc");
@@ -1127,6 +1653,148 @@ mod tests {
     }
 
     // ---------- Cookies DB 候选路径解析 ----------
+
+    /// 宽松 i64 读取的各值形态：Integer 直取；整值 Real / 数字 Text 可解释；
+    /// NULL / 小数 Real / 非数字 Text / Blob → None
+    #[test]
+    fn value_ref_as_i64_accepts_numeric_forms() {
+        use rusqlite::types::ValueRef;
+        assert_eq!(value_ref_as_i64(ValueRef::Integer(42)), Some(42));
+        assert_eq!(value_ref_as_i64(ValueRef::Integer(0)), Some(0));
+        assert_eq!(value_ref_as_i64(ValueRef::Real(1.7e16)), Some(17_000_000_000_000_000));
+        assert_eq!(value_ref_as_i64(ValueRef::Real(1.5)), None);
+        assert_eq!(value_ref_as_i64(ValueRef::Text(b"123")), Some(123));
+        assert_eq!(value_ref_as_i64(ValueRef::Text(b" 456 ")), Some(456));
+        assert_eq!(value_ref_as_i64(ValueRef::Text(b"abc")), None);
+        assert_eq!(value_ref_as_i64(ValueRef::Null), None);
+        assert_eq!(value_ref_as_i64(ValueRef::Blob(b"123")), None);
+    }
+
+    /// expires_utc 无有效数值的 cookie 不再被 unwrap_or(0) 换算成 1601 年附近
+    /// 而整库误判过期：按会话 cookie 保留，计入 expires_unknown（真凶定位计数）。
+    /// 覆盖两种形态：expires_utc=0 且 has_expires=1 的矛盾行（schema NOT NULL，
+    /// Edge 156 最大嫌疑）、非数字 TEXT（类型不符）。
+    #[test]
+    fn read_and_decrypt_keeps_cookie_with_unreadable_expires() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(COOKIES_SCHEMA).unwrap();
+        let key = *derive_cookie_key(b"peanuts");
+        let insert = |name: &str, expires: rusqlite::types::Value| {
+            conn.execute(
+                "INSERT INTO cookies (creation_utc, host_key, name, value, encrypted_value, \
+                 path, expires_utc, is_secure, is_httponly, has_expires, samesite) \
+                 VALUES (0, '.kimi.com', ?1, 'v', x'', '/', ?2, 0, 0, 1, -1)",
+                rusqlite::params![name, expires],
+            )
+            .unwrap();
+        };
+        insert("zero-exp", rusqlite::types::Value::Integer(0));
+        insert("text-exp", rusqlite::types::Value::Text("not-a-number".to_string()));
+        // 正常会话 cookie（0 + has_expires=0）：保留但不计 expires_unknown
+        conn.execute(
+            "INSERT INTO cookies (creation_utc, host_key, name, value, encrypted_value, \
+             path, expires_utc, is_secure, is_httponly, has_expires, samesite) \
+             VALUES (0, '.kimi.com', 'session-ok', 'v', x'', '/', 0, 0, 0, 0, -1)",
+            [],
+        )
+        .unwrap();
+
+        let (matched, skips, cookies) =
+            read_and_decrypt(&conn, &key, &["www.kimi.com".to_string()]).unwrap();
+        assert_eq!(matched, 3);
+        assert_eq!(skips.expired, 0); // 不再误判过期
+        assert_eq!(skips.expires_unknown, 2); // 矛盾行 + TEXT；正常会话不计
+        assert_eq!(cookies.len(), 3); // 全部保留
+        for c in &cookies {
+            assert!(!c.has_expires); // 会话 cookie 语义
+            assert_eq!(c.expires_utc, 0);
+        }
+    }
+
+    /// 解密成功但明文非 UTF-8 → 计入 utf8 skip
+    #[test]
+    fn read_and_decrypt_skips_non_utf8_plaintext() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(COOKIES_SCHEMA).unwrap();
+        let key = *derive_cookie_key(b"peanuts");
+        conn.execute(
+            "INSERT INTO cookies (creation_utc, host_key, name, value, encrypted_value, \
+             path, expires_utc, is_secure, is_httponly, has_expires, samesite) \
+             VALUES (0, '.kimi.com', 'bin', '', ?1, '/', 0, 0, 0, 0, -1)",
+            rusqlite::params![encrypt_v10(&key, &[0xff, 0xfe, 0xfd, 0xfc])],
+        )
+        .unwrap();
+        let (matched, skips, cookies) =
+            read_and_decrypt(&conn, &key, &["www.kimi.com".to_string()]).unwrap();
+        assert_eq!(matched, 1);
+        assert_eq!(skips.utf8, 1);
+        assert_eq!(skips.decrypt, 0); // 解密本身成功
+        assert!(cookies.is_empty());
+    }
+
+    // ---------- Edge 156+ domain hash 前缀 ----------
+
+    /// SHA-256(host_key) 前缀的校验/剥离：匹配 → 剥掉；不匹配 / 太短 → None
+    #[test]
+    fn strip_domain_hash_prefix_matches_only_host_hash() {
+        use sha2::{Digest, Sha256};
+        let mut blob = Sha256::digest(b".kimi.com").to_vec();
+        blob.extend_from_slice(b"tok-xyz");
+        assert_eq!(
+            strip_domain_hash_prefix(&blob, ".kimi.com"),
+            Some(b"tok-xyz".as_slice())
+        );
+        // host_key 不同（含前导点差异）→ hash 不匹配
+        assert_eq!(strip_domain_hash_prefix(&blob, "kimi.com"), None);
+        // 旧格式明文（无前缀）→ 不剥
+        assert_eq!(strip_domain_hash_prefix(b"plain-value", ".kimi.com"), None);
+        // 短于 32 字节 → 不剥
+        assert_eq!(strip_domain_hash_prefix(&blob[..31], ".kimi.com"), None);
+        // 恰好 32 字节（hash + 空值）→ 剥成空串
+        assert_eq!(
+            strip_domain_hash_prefix(&blob[..32], ".kimi.com"),
+            Some(b"".as_slice())
+        );
+    }
+
+    /// Edge 156+ 真实格式端到端：v10 密文 = AES(SHA-256(host_key) + value)，
+    /// 解密后剥前缀得到正确 value；旧格式（无前缀）行同库共存互不影响
+    #[test]
+    fn read_and_decrypt_strips_edge156_domain_hash() {
+        use sha2::{Digest, Sha256};
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(COOKIES_SCHEMA).unwrap();
+        let key = *derive_cookie_key(b"peanuts");
+        let mut blob = Sha256::digest(b".kimi.com").to_vec();
+        blob.extend_from_slice(b"tok-edge156");
+        let insert = |name: &str, enc: Vec<u8>| {
+            conn.execute(
+                "INSERT INTO cookies (creation_utc, host_key, name, value, encrypted_value, \
+                 path, expires_utc, is_secure, is_httponly, has_expires, samesite) \
+                 VALUES (0, '.kimi.com', ?1, '', ?2, '/', 0, 0, 0, 0, -1)",
+                rusqlite::params![name, enc],
+            )
+            .unwrap();
+        };
+        insert("edge156", encrypt_v10(&key, &blob));
+        insert("legacy", encrypt_v10(&key, b"tok-legacy"));
+
+        let (matched, skips, cookies) =
+            read_and_decrypt(&conn, &key, &["www.kimi.com".to_string()]).unwrap();
+        assert_eq!(matched, 2);
+        assert_eq!(skips.utf8, 0);
+        assert_eq!(skips.decrypt, 0);
+        assert_eq!(cookies.len(), 2);
+        assert_eq!(
+            cookies.iter().find(|c| c.name == "edge156").unwrap().value,
+            "tok-edge156"
+        );
+        assert_eq!(
+            cookies.iter().find(|c| c.name == "legacy").unwrap().value,
+            "tok-legacy"
+        );
+    }
+
 
     /// 测试用临时目录（drop 时递归删除，不影响真实浏览器数据）
     struct TmpDir(PathBuf);
@@ -1168,6 +1836,178 @@ mod tests {
                 PathBuf::from("/fake/base/Network/Cookies"),
             ]
         );
+    }
+
+    // ---------- localStorage 导入 ----------
+
+    /// origin_of：默认端口省略、显式端口保留；与 LevelDB 键的前缀精确匹配
+    #[test]
+    fn origin_of_forms_exact_origin() {
+        let u = url::Url::parse("https://www.kimi.com/").unwrap();
+        assert_eq!(origin_of(&u).as_deref(), Some("https://www.kimi.com"));
+        let u = url::Url::parse("https://example.com:8443/chat").unwrap();
+        assert_eq!(origin_of(&u).as_deref(), Some("https://example.com:8443"));
+        let u = url::Url::parse("about:blank").unwrap();
+        assert_eq!(origin_of(&u), None);
+    }
+
+    /// ls 目录候选：profile 布局在前、数据根（Opera 布局）兜底
+    #[test]
+    fn ls_db_candidates_order() {
+        let base = Path::new("/fake/base");
+        assert_eq!(
+            ls_db_candidates(base, "Profile 1"),
+            vec![
+                PathBuf::from("/fake/base/Profile 1/Local Storage/leveldb"),
+                PathBuf::from("/fake/base/Local Storage/leveldb"),
+            ]
+        );
+    }
+
+    /// 注入脚本：首行条目计数头（tabs::ls_scripts_entry_count 的依据）+
+    /// 键值 JSON 转义（引号/换行/`</script>` 等任意字符安全内嵌，可原样
+    /// 解析回原值）
+    #[test]
+    fn build_ls_inject_js_escapes_and_counts() {
+        let entries = vec![
+            LsEntry {
+                key: "access_token".into(),
+                value: "v\"1\n2\t3".into(),
+            },
+            LsEntry {
+                key: "k</script>".into(),
+                value: "plain".into(),
+            },
+        ];
+        let js = build_ls_inject_js(&entries);
+        assert!(js.starts_with("// entries: 2\n"));
+        assert!(js.contains("localStorage.setItem"));
+        // 从 `var d=` 之后流式解析第一个 JSON 值（不能找 `]`——脚本里
+        // `d[i][1]` 也含方括号）
+        let marker = "var d=";
+        let rest = &js[js.find(marker).unwrap() + marker.len()..];
+        let parsed: Vec<(String, String)> =
+            serde_json::Deserializer::from_str(rest)
+                .into_iter()
+                .next()
+                .unwrap()
+                .unwrap();
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(
+            parsed[0],
+            ("access_token".to_string(), "v\"1\n2\t3".to_string())
+        );
+        assert_eq!(parsed[1], ("k</script>".to_string(), "plain".to_string()));
+    }
+
+    /// localStorage 测试站点配置（kimi 同形）
+    fn ls_kimi_site() -> SiteConfig {
+        SiteConfig {
+            id: "kimi".into(),
+            name: "Kimi".into(),
+            url: url::Url::parse("https://www.kimi.com/").unwrap(),
+            icon: "kimi".into(),
+            injector_src: "",
+            injector_ver: "0".into(),
+            import_local_storage: true,
+        }
+    }
+
+    /// scan_local_storage 端到端（手工构造 leveldb SSTable）：
+    /// - 跨 profile 扫描（kimi token 实测在非 Default profile）；
+    /// - last_used profile 优先（同键先扫到者胜，与 cookie 去重一致）；
+    /// - origin 精确过滤（他站键与近似域名 `www.kimi.com.evil.com` 不混入）；
+    /// - Latin1 与 UTF-16 两种编码的值都解码。
+    #[test]
+    fn scan_local_storage_end_to_end() {
+        use crate::local_storage_db::test_support as ls;
+
+        let tmp = make_tmp_dir("ls-e2e");
+        let base = tmp.0.join("Edge");
+        let p1 = base.join("Profile 1/Local Storage/leveldb");
+        let def = base.join("Default/Local Storage/leveldb");
+        std::fs::create_dir_all(&p1).unwrap();
+        std::fs::create_dir_all(&def).unwrap();
+
+        // Profile 1（last_used）：kimi 主数据 + 他站键 + 近似域名键（后两者应被过滤）
+        let sstable_p1 = ls::build_sstable(&[vec![
+            (
+                ls::ls_key("https://www.kimi.com", "access_token"),
+                ls::ls_encode_latin1("tok-profile1"),
+            ),
+            (
+                ls::ls_key("https://www.kimi.com", "msh_user_id"),
+                ls::ls_encode_latin1("u1"),
+            ),
+            (
+                ls::ls_key("https://chat.deepseek.com", "x"),
+                ls::ls_encode_latin1("other-site"),
+            ),
+            (
+                ls::ls_key("https://www.kimi.com.evil.com", "y"),
+                ls::ls_encode_latin1("evil"),
+            ),
+        ]]);
+        std::fs::write(p1.join("000001.ldb"), sstable_p1).unwrap();
+
+        // Default：同键旧值（Profile 1 先扫、应胜出）+ Default 独有键（UTF-16 值）
+        let sstable_def = ls::build_sstable(&[vec![
+            (
+                ls::ls_key("https://www.kimi.com", "access_token"),
+                ls::ls_encode_latin1("tok-default-older"),
+            ),
+            (
+                ls::ls_key("https://www.kimi.com", "theme"),
+                ls::ls_encode_utf16("dark"),
+            ),
+        ]]);
+        std::fs::write(def.join("000001.ldb"), sstable_def).unwrap();
+
+        let scan = ProfileScan {
+            profiles: vec!["Profile 1".to_string(), "Default".to_string()],
+            local_state_denied: false,
+        };
+        let kimi = ls_kimi_site();
+        let (entries, total) = scan_local_storage(&base, &scan, "Edge", &[&kimi]).unwrap();
+
+        assert_eq!(total, 3);
+        let got = &entries["kimi"];
+        // read_origin_entries 内按 key 排序：access_token, msh_user_id, theme
+        assert_eq!(got[0].key, "access_token");
+        assert_eq!(got[0].value, "tok-profile1"); // last_used profile 先扫先得
+        assert_eq!(got[1].key, "msh_user_id");
+        assert_eq!(got[1].value, "u1");
+        assert_eq!(got[2].key, "theme");
+        assert_eq!(got[2].value, "dark"); // UTF-16 值解码
+        // 他站 / 近似域名键未混入
+        assert!(got
+            .iter()
+            .all(|e| !e.value.contains("other-site") && !e.value.contains("evil")));
+    }
+
+    /// 验证探针：只内嵌键名（无 value）、写 fama-ls-verify fragment
+    #[test]
+    fn ls_verify_probe_js_shape() {
+        let js = ls_verify_probe_js(&["access_token".to_string(), "msh_user_id".to_string()]);
+        assert!(js.contains(r#"["access_token","msh_user_id"]"#));
+        assert!(js.contains("#fama-ls-verify='+p+'/'+t"));
+        assert!(js.contains("localStorage.getItem"));
+    }
+
+    /// 浏览器从未用过 localStorage（目录缺失）不算错误：空结果、零条目
+    #[test]
+    fn scan_local_storage_missing_dirs_is_ok() {
+        let tmp = make_tmp_dir("ls-missing");
+        let base = tmp.0.join("Edge");
+        std::fs::create_dir_all(&base).unwrap();
+        let scan = ProfileScan {
+            profiles: vec!["Default".to_string()],
+            local_state_denied: false,
+        };
+        let kimi = ls_kimi_site();
+        let (entries, total) = scan_local_storage(&base, &scan, "Edge", &[&kimi]).unwrap();
+        assert_eq!(total, 0);
+        assert!(entries.is_empty());
     }
 
     /// Chrome 式布局：Cookies 在 profile 子目录下（新旧两种位置）
@@ -1591,5 +2431,25 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(err.code, E_BROWSER_DATA_MISSING);
+    }
+
+    // ---------- 启动自动导入守卫 ----------
+
+    /// 测试间复位守卫（仅测试用；生产代码不 reset）
+    #[cfg(test)]
+    fn reset_auto_import_gate() {
+        AUTO_IMPORT_ATTEMPTED.store(false, Ordering::SeqCst);
+    }
+
+    /// 首次 check-and-set 通过，第二次返回「已尝试」；复位后重新通过
+    #[test]
+    fn auto_import_gate_allows_once_per_process() {
+        reset_auto_import_gate();
+        assert!(!auto_import_gate()); // 首次：未尝试过，放行（并置位）
+        assert!(auto_import_gate()); // 再次：已尝试过，拒绝
+        assert!(auto_import_gate()); // 持续拒绝
+        reset_auto_import_gate();
+        assert!(!auto_import_gate()); // 复位后重新放行
+        reset_auto_import_gate(); // 不污染其他测试
     }
 }

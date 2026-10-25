@@ -58,6 +58,12 @@ export interface ImportReport {
   skippedDecrypt: number;
   skippedOther: number;
   reloaded: string[];
+  /** localStorage 扫描读到的条目数（kimi 等不走 cookie 认证的站点） */
+  lsRead: number;
+  /** 已加载页面上立即注入的 localStorage 条数 */
+  lsInjected: number;
+  /** 挂起待站点首次加载完成注入的 localStorage 条数 */
+  lsPending: number;
 }
 
 export async function listSites(): Promise<SiteInfo[]> {
@@ -99,9 +105,20 @@ export async function rate(
   await invoke("rate", { roundId, siteId, rating });
 }
 
-/** 从默认 Chromium 系浏览器导入登录 cookie；siteIds 为空 = 全部站点 */
+/** 从默认 Chromium 系浏览器导入登录 cookie（手动入口）；siteIds 为空 = 全部站点 */
 export async function importBrowserSession(
   siteIds: string[],
 ): Promise<ImportReport> {
   return invoke("import_browser_session", { siteIds });
+}
+
+/**
+ * 启动时自动导入登录 cookie（每进程至多一次；重复调用 reject
+ * "E_AUTO_ALREADY_RUN"，调用方应静默忽略）。macOS 首次会在读取浏览器
+ * Safe Storage 时弹 Keychain 授权框——那既是授权点也是用户感知点。
+ */
+export async function importBrowserSessionAuto(
+  siteIds: string[],
+): Promise<ImportReport> {
+  return invoke("import_browser_session_auto", { siteIds });
 }

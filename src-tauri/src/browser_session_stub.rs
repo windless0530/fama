@@ -21,6 +21,10 @@ pub struct ImportReport {
     pub skipped_decrypt: usize,
     pub skipped_other: usize,
     pub reloaded: Vec<String>,
+    // 以下三个 localStorage 字段与 macOS 实现同步（本 stub 永远返回 0）
+    pub ls_read: usize,
+    pub ls_injected: usize,
+    pub ls_pending: usize,
 }
 
 /// 带 "E_XXX" 错误码的导入失败（与 macOS 实现同形，commands 层统一拼接）
@@ -32,6 +36,17 @@ pub struct ImportError {
 }
 
 pub fn import(_app: &AppHandle<Wry>, _targets: &[SiteConfig]) -> Result<ImportReport, ImportError> {
+    Err(ImportError {
+        code: "E_UNSUPPORTED_PLATFORM",
+        message: "浏览器登录态导入目前仅支持 macOS".into(),
+    })
+}
+
+/// 启动自动导入入口（与 macOS 实现同签名；本平台一律不支持）
+pub fn import_auto(
+    _app: &AppHandle<Wry>,
+    _targets: &[SiteConfig],
+) -> Result<ImportReport, ImportError> {
     Err(ImportError {
         code: "E_UNSUPPORTED_PLATFORM",
         message: "浏览器登录态导入目前仅支持 macOS".into(),

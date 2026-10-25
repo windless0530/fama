@@ -221,9 +221,13 @@ async function famaSend() {
 
 #### 2.5.1 从默认浏览器导入登录 cookie（macOS）
 
-App 与系统浏览器默认互相隔离，新装机后各站点需要重新登录。为此提供**用户主动触发的登录态导入**（`browser_session.rs`，TabBar 🔑 入口）：
+App 与系统浏览器默认互相隔离，新装机后各站点需要重新登录。为此提供两条共用同一实现的入口（`browser_session.rs`）：
 
-- **范围（有意收窄）**：仅支持 Chromium 系默认浏览器（Chrome / Edge / Brave / Vivaldi / Opera / Chromium）。读取其 `"<Browser> Safe Storage"` 钥匙串条目派生解密 key（PBKDF2-HMAC-SHA1 → AES-128-CBC，Chromium v10 格式），以临时副本只读查询 Cookies 数据库，**只导入已配置站点 host 匹配的 cookie**，注入 `WKWebsiteDataStore.defaultDataStore().httpCookieStore`，并 reload 已加载的站点页面。
+- **启动自动导入**（`import_auto`，App mount 后前端经 `import_browser_session_auto` 触发）：启动即复用默认浏览器登录态，**每进程至多一次**（AtomicBool 守卫，防 dev 热重载反复触发 / 反复弹 Keychain；重复调用返回 `E_AUTO_ALREADY_RUN`，前端静默忽略）。成功在状态栏提示；零注入 / 失败自动打开 ImportDialog 展示原因（`initialError`）并可原地重试——**不静默失败**。授权模型：自动路径无前端确认框，macOS Keychain ACL 弹窗即用户授权点。
+- **手动导入**（TabBar 🔑 入口 → ImportDialog 确认框 → `import_browser_session`）：不受每进程一次守卫限制，始终可重试。
+
+- **范围（有意收窄）**：仅支持 Chromium 系默认浏览器（Chrome / Edge / Brave / Vivaldi / Opera / Chromium）。读取其 `"<Browser> Safe Storage"` 钥匙串条目派生解密 key（PBKDF2-HMAC-SHA1 → AES-128-CBC，Chromium v10 格式），以临时副本只读查询 Cookies 数据库，**只导入已配置站点 host 匹配的 cookie**，注入 `WKWebsiteDataStore.defaultDataStore().httpCookieStore`，并 reload 已加载的站点页面；注入时仍未完成首次加载的页面（其导航请求早于注入发出、不带新 cookie）由 `Tabs::pending_reload` 在首载完成（on_page_load Finished）时补一次 reload（remove 语义消费，防 reload 循环），导入后创建的 webview 首导航自然带新 cookie——三类时序全覆盖。
+- **v10 明文的 domain hash 前缀（Edge 156+）**：Edge 156 起（实测 156.0.4314.42，macOS 上 app-bound 的等价方案），v10 解密后的明文不是 cookie 值，而是 `SHA-256(host_key)[32B] + value`（与 Windows v20 的 domain hash 前缀同款）。解密后按 host_key 校验并剥掉前 32 字节；hash 不匹配按旧格式（明文即值）处理，新旧格式同库共存互不影响。Chrome/Brave 等旧版无前缀，走旧路径。
 - **双重授权**：① 前端确认框说明范围与风险；② macOS Keychain ACL 弹窗（系统在 app 首次读取该条目时弹出）。任一拒绝即干净失败，不自动重试；派生 key 缓存在本次进程内存，重复导入不再弹 Keychain。
 - **硬前提（macOS TCC / 完全磁盘访问）**：Chromium 系浏览器的用户数据目录受 macOS 隐私保护（TCC）——fama 进程读取 `Local State` / `Cookies` 文件内容会得到 EPERM/EACCES（但 `stat` / `is_file()` 元数据探测不受影响）。因此导入前必须给运行环境授权：「系统设置 → 隐私与安全性 → 完全磁盘访问」——开发模式（`npm run tauri dev`）给运行它的终端 App（如 iTerm2 / Terminal）授权，安装版给 fama.app 授权；授权后完全退出并重启该 App。未授权时导入报 `E_BROWSER_DATA_TCC_DENIED`（含上述指引），一次失败即返回、不重试。
 - **多 profile 扫描**：`Local State` 可读时取 `profile.info` 的 key 集合（保证含 `Default`）、`last_used` 优先；不可读（TCC 拒绝）时回退探测已知命名 `Default`、`Profile 1..9`（`is_file()` 元数据探测仍可用）。对所有定位到 Cookies DB 的 profile 逐一副本读取、过滤解密，结果按 (host_key, name) 去重合并（先扫描的 profile 优先；同一 DB 路径只读一次，兼容 Opera 根目录布局）；单个 profile 解密 / 读取失败跳过、不影响其余，全部失败才报错。
@@ -231,6 +235,28 @@ App 与系统浏览器默认互相隔离，新装机后各站点需要重新登�
 - **数据安全**：Safe Storage 原始 secret 读出即 zeroize；Cookies DB 副本放在临时目录、任何退出路径删除；解密后的 cookie 只注入本 app 自己的 WebKit 数据容器（defaultDataStore，仅本 app 可见），不做中间落盘——但带有效期的 cookie 可能由 WebKit 持久化到本机容器内，与在 app 里正常登录产生的 cookie 行为一致。
 - **平台**：Windows（DPAPI）/ Linux（Secret Service）等价能力不在 v1 范围，非 macOS 返回 `E_UNSUPPORTED_PLATFORM`。
 - **已知限制**：`NSHTTPCookie` 无法完整表达部分 cookie 属性（HttpOnly / SameSite=None 借助 Foundation 私有属性键尽量保留）；Cookies DB 按候选顺序探测 `{profile}/Cookies` → `{profile}/Network/Cookies` → 数据根 `Cookies` → 数据根 `Network/Cookies`（兼容 Chrome 新版 `Network/` 迁移与 Opera 稳定版无 profile 子目录的布局）；Chromium 未来若更换加密方案（如 v20 app-bound），表现为 skipped 增多并在报告中可见。
+
+#### 2.5.2 localStorage 导入（kimi 等不走 cookie 认证的站点）
+
+**问题**：kimi（www.kimi.com，Next.js SPA）登录 token 不在 cookie，而在 localStorage（如 `access_token`），请求经 Authorization 头携带——cookie 导入对它天然无效。站点通过 sites.toml 逐站点开关：`import_local_storage = true`（当前仅 kimi），是通用能力而非 kimi 特判。
+
+**实证存储格式**（2026-10-25 本机 Edge 156 实测 + Chromium master 源码双重确认，blink `cached_storage_area.cc`）：
+
+- 位置：`{profile}/Local Storage/leveldb/`（`.ldb` SSTable + `.log` WAL；Opera 布局在数据根下，同 Cookies 布局差异）；
+- user key = `'_' + origin + '\x00' + <1B key flag> + key`，value = `<1B flag> + payload`；flag 即 `enum StorageFormat : uint8_t`：`0x00`=UTF-16LE、`0x01`=Latin-1（社区流传的 "\x00\x01 scheme-id v2" 实为该 flag）；
+- `META:` / `METAACCESS:` 前缀键是 Chromium 元数据（protobuf），第三方分区键形如 `scheme://host/^N<site>`——都天然不会被 origin 前缀匹配命中；
+- **Edge 156 的 SSTable block 用 zstd 压缩**（snappy 报 corrupt；按 block trailer 压缩类型 + zstd magic 自适应 none/snappy/zstd）。
+
+**实现**（`local_storage_db.rs`，只读解析器；复用 §2.5.1 的浏览器检测 / profile 枚举 / TCC 分类 / 双重授权模型，与 cookie 流程同一次 import 串联执行）：
+
+- 手写最小 LevelDB 只读解析（varint、block 前缀解压、footer→index→data blocks 遍历、WAL 32KB record 重组、WriteBatch、seq 大者胜 + 删除生效的合并语义、origin 前缀过滤）——不引入 rusty-leveldb：其依赖 integer-encoding 1.1.7 在 aarch64 有未对齐解引用崩溃，且不支持 zstd；
+- **直接读源文件不复制**：LevelDB 是追加型日志结构，只读解析容忍 torn write（最后几条不一致记录由解析器跳过，无损坏风险）；
+- **多 profile 扫描是硬要求**：实测 kimi token 在 Edge `Profile 1`（Default 只有旧域名空残留）；同键先扫到的 profile 胜（`last_used` 优先，与 cookie 去重一致）；
+- 注入：在对应站点 webview 的页面上下文 eval `localStorage.setItem(k, v)`（WKWebView localStorage 按 origin 隔离），随后 reload——一次刷新同时生效 cookie 与 localStorage；与 `pending_reload` 合并编排（`Tabs::reload_loaded(site_ids, ls_scripts)`）：已加载站点立即 eval+reload，未完成首载的挂 `pending_ls` 在首载 Finished 时 eval+reload（remove 语义消费，防循环；有 ls 的站点不再挂 `pending_reload`，避免二次 reload）；
+- ImportReport 增加 `lsRead` / `lsInjected` / `lsPending`，前端状态栏与 ImportDialog 均展示；读到但未能注入（站点页面不可用等）在 UI 可见提示，**不静默**；
+- **数据安全**：value 永不落日志（`FAMA_DEBUG_IMPORT=1` 也只打键名+长度）；注入脚本经 serde_json 转义任意字符；读不到（浏览器未登录过该站点）不算失败、计 0 可见。
+
+**kimi 登录态判定（不以 URL 判定）**：kimi 是 SPA，登录与否不改变 URL。判定信号：① 注入后在 webview eval 检查 `localStorage.getItem('access_token')` 非空；② 页面 DOM 登录态元素（用户头像 / 输入框可用）或注入器回传的 filled 状态。URL 只能证明页面加载，不能证明登录。
 
 ## 3. 数据库设计（store.rs）
 
@@ -286,7 +312,8 @@ interface Round       { id: number; question: string; createdAt: number; targets
 | `dispatch_question` | `(question, siteIds, autoSend) → DispatchResult[]` | 核心命令 |
 | `list_rounds` | `(limit=50, before?: createdAt) → Round[]` | 历史分页 |
 | `rate` | `(roundId, siteId, rating: 1|-1) → void` | 同值=撤销 |
-| `import_browser_session` | `(siteIds) → ImportReport` | 从默认 Chromium 系浏览器导入登录 cookie（§2.5.1）；siteIds 为空=全部站点 |
+| `import_browser_session` | `(siteIds) → ImportReport` | 手动导入登录态（cookie §2.5.1 + localStorage §2.5.2，🔑 入口）；siteIds 为空=全部站点 |
+| `import_browser_session_auto` | `(siteIds) → ImportReport` | 启动自动导入（§2.5.1 / §2.5.2）；每进程一次，重复调用返回 `E_AUTO_ALREADY_RUN` |
 | `write_clipboard` | `(text) → void` | 降级路径（仅注入失败时调用） |
 
 错误码（invoke reject 的 `code` 字段）：`E_SITES_CONFIG` / `E_TAB_CREATE` / `E_TAB_NOT_READY` / `E_INJECT_TIMEOUT` / `E_INJECT_SCRIPT` / `E_DB`；导入相关：`E_NO_SITES` / `E_DETECT_FAILED` / `E_UNSUPPORTED_BROWSER` / `E_KEYCHAIN_NOT_FOUND` / `E_KEYCHAIN_DENIED` / `E_BROWSER_DATA_MISSING` / `E_BROWSER_DATA_TCC_DENIED` / `E_COOKIE_DB_LOCKED` / `E_DECRYPT_FAILED` / `E_INJECT_FAILED` / `E_UNSUPPORTED_PLATFORM`。
@@ -303,6 +330,8 @@ interface ImportReport {
   reloaded: string[]       // 注入后触发 reload 的站点 id
 }
 ```
+
+诊断：后端全程打 `[import]` 结构化日志（stderr），skip 原因细分（expired / utf8 / decrypt / read / expires_unknown）；设 `FAMA_DEBUG_IMPORT=1` 时额外打印每条被跳过 cookie 的 host / name / expires_utc 原始值与换算值、解密错误类别、明文前 8 字节 hex（永不打印完整 value），以及每个 Cookies 库的 schema 原文与最新 last_access（区分 schema 变化 vs 旧库）。
 
 ## 5. 前端设计（src/）
 

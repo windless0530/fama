@@ -28,3 +28,6 @@ name = "Kimi"
 url = "https://www.kimi.com/"
 icon = "kimi"
 injector = "kimi"
+# kimi（Next.js SPA）不走 cookie 认证：登录 token 存 localStorage（如
+# access_token），需要从默认浏览器导入 localStorage（见 design.md §2.5.2）
+import_local_storage = true

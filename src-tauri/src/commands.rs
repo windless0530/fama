@@ -144,15 +144,11 @@ pub async fn rate(
     db.0.set_rating(round_id, &site_id, rating)
 }
 
-/// 从默认 Chromium 系浏览器导入登录 cookies（用户已在前端确认框同意后调用）。
-/// 流程与授权模型见 browser_session.rs 模块注释；site_ids 为空 = 全部站点。
-/// Keychain ACL 弹窗会阻塞到用户应答，重活放 spawn_blocking 不占异步线程。
-#[tauri::command]
-pub async fn import_browser_session(
-    app: AppHandle<Wry>,
-    sites: State<'_, Sites>,
-    site_ids: Vec<String>,
-) -> Result<browser_session::ImportReport, String> {
+/// site_ids → 站点配置全集（site_ids 为空 = 全部站点）
+fn resolve_targets(
+    sites: &Sites,
+    site_ids: &[String],
+) -> Result<Vec<crate::sites::SiteConfig>, String> {
     let targets: Vec<crate::sites::SiteConfig> = if site_ids.is_empty() {
         sites.0.clone()
     } else {
@@ -166,9 +162,54 @@ pub async fn import_browser_session(
     if targets.is_empty() {
         return Err("E_NO_SITES: 未选择任何有效站点".into());
     }
+    Ok(targets)
+}
+
+/// 后台线程执行导入（Keychain ACL 弹窗会阻塞到用户应答，不占异步线程）；
+/// 失败统一在 stderr 记一条 `[import]` 日志（诊断「不生效」定位用）。
+/// auto = 启动自动导入（走 browser_session::import_auto 的每进程一次守卫）。
+async fn run_import(
+    app: AppHandle<Wry>,
+    targets: Vec<crate::sites::SiteConfig>,
+    auto: bool,
+) -> Result<browser_session::ImportReport, String> {
     tauri::async_runtime::spawn_blocking(move || {
-        browser_session::import(&app, &targets).map_err(|e| format!("{}: {}", e.code, e.message))
+        let res = if auto {
+            browser_session::import_auto(&app, &targets)
+        } else {
+            browser_session::import(&app, &targets)
+        };
+        res.map_err(|e| {
+            eprintln!("[import] failed: {}: {}", e.code, e.message);
+            format!("{}: {}", e.code, e.message)
+        })
     })
     .await
     .map_err(|e| format!("E_INJECT_FAILED: 导入任务异常 {e}"))?
+}
+
+/// 从默认 Chromium 系浏览器导入登录 cookies（手动入口：🔑 ImportDialog，
+/// 用户已在前端确认框同意后调用）。流程与授权模型见 browser_session.rs 模块注释；
+/// site_ids 为空 = 全部站点。
+#[tauri::command]
+pub async fn import_browser_session(
+    app: AppHandle<Wry>,
+    sites: State<'_, Sites>,
+    site_ids: Vec<String>,
+) -> Result<browser_session::ImportReport, String> {
+    let targets = resolve_targets(&sites, &site_ids)?;
+    run_import(app, targets, false).await
+}
+
+/// 启动时自动导入登录 cookies（App mount 后前端触发，无需确认框；
+/// 每进程至多一次，重复调用返回 E_AUTO_ALREADY_RUN——前端静默忽略）。
+/// 用户感知与授权点：macOS Keychain ACL 弹窗（浏览器 Safe Storage）。
+#[tauri::command]
+pub async fn import_browser_session_auto(
+    app: AppHandle<Wry>,
+    sites: State<'_, Sites>,
+    site_ids: Vec<String>,
+) -> Result<browser_session::ImportReport, String> {
+    let targets = resolve_targets(&sites, &site_ids)?;
+    run_import(app, targets, true).await
 }
